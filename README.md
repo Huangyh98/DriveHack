@@ -150,9 +150,9 @@ cd DriveHack && bash setup.sh
 `setup.sh` will:
 1. ✅ Copy 8 scripts to `tools/`
 2. ✅ Copy the 5-camera config to `configs/`
-3. ✅ Download `runner_seq.npz` (character animation, 118MB) — **[configure the download link first](assets/download_assets.sh)**
+3. ✅ Download `runner_seq.npz` (character animation, 118MB) from [GitHub Releases](https://github.com/Huangyh98/DriveHack/releases/tag/v1.0)
 
-If auto-download isn't configured, see [Custom Character Baking](#-custom-character-baking) to generate it yourself, or manually place `runner_seq.npz` at `outputs/assets/runner_seq.npz`.
+> If the download fails, see [Custom Character Baking](#-custom-character-baking) to generate it yourself with Blender.
 
 ## 🚀 Quick Start
 
