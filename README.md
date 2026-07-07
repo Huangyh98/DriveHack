@@ -22,12 +22,10 @@
 </tr>
 <tr>
 <td width="50%" align="center">
-<a href="https://github.com/Huangyh98/DriveHack/raw/main/assets/trac_demo.mp4"><img src="assets/banner.jpg" width="100%" alt="Trajectory Editor Demo"></a>
-<br><a href="https://github.com/Huangyh98/DriveHack/raw/main/assets/trac_demo.mp4">▶️ Watch Demo</a>
+<img src="assets/trac_demo.gif" width="100%" alt="Trajectory Editor Demo">
 </td>
 <td width="50%" align="center">
-<a href="https://github.com/Huangyh98/DriveHack/raw/main/assets/scene23.mp4"><img src="assets/banner.jpg" width="100%" alt="Rendered Output"></a>
-<br><a href="https://github.com/Huangyh98/DriveHack/raw/main/assets/scene23.mp4">▶️ Watch Render</a>
+<img src="assets/scene23.gif" width="100%" alt="Rendered Output">
 </td>
 </tr>
 </table>
