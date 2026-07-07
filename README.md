@@ -1,137 +1,199 @@
-# Adversarial Drive Studio
+<div align="center">
 
-在 [DriveStudio](https://github.com/ziyc/drivestudio) (OmniRe) 重建的自动驾驶 3DGS 场景中，沿自定义轨迹放置一个带纹理的跑步角色，生成对抗样本视频。
+# 🏃 DriveHack
 
-## 功能
+### Drop a ghost runner into any 3DGS driving scene, along a custom trajectory, slide-free.
 
-- 🗺️ **BEV 轨迹规划**：基于 LiDAR 点云 + 障碍物包围盒的鸟瞰图，点击画轨迹
-- 🎮 **3D 实时预览**：浏览器中以 3DGS 实时渲染场景，点击添加路径点，检查碰撞、地面贴合
-- 👟 **步频匹配**：根据轨迹长度和视频帧数自动计算步频，确保**不滑步、不超时、不残留**
-- 🎬 **五视角渲染**：五相机 + BEV 小地图的 3×2 网格视频，深度遮挡合成
-- 📦 **导出/查看工具**：导出 3DGS checkpoint 为 PLY，交互式查看器
+[![Python](https://img.shields.io/badge/Python-3.9+-blue)](https://www.python.org/)
+[![PyTorch](https://img.shields.io/badge/PyTorch-2.0+-red)](https://pytorch.org/)
+[![License](https://img.shields.io/badge/License-MIT-green)](LICENSE)
 
-## 快速开始
+<p>
+  <a href="#quick-start">Quick Start</a> •
+  <a href="#features">Features</a> •
+  <a href="docs/trajectory_pipeline.md">Docs</a> •
+  <a href="#how-it-works">How It Works</a>
+</p>
 
-### 前提条件
+<img src="assets/banner.png" width="100%" alt="DriveHack: 5-camera grid with ghost runner">
 
-1. 已安装并配置好 [DriveStudio](https://github.com/ziyc/drivestudio)
-2. 已有训练好的场景 checkpoint（如 `outputs/waymo_omnire/scene23/checkpoint_final.pth`）
-3. 已下载 Waymo 处理数据（如 `data/waymo/processed/training/023/`）
-4. GPU 环境（conda 环境 `drivestudio`）
+</div>
 
-### 一键安装
+## Overview
 
-```bash
-# 在 DriveStudio 根目录下执行
-cd /path/to/drivestudio
+DriveHack lets you **inject a fully-textured running character** into a [DriveStudio](https://github.com/ziyc/drivestudio) / OmniRe reconstructed autonomous driving scene, moving along a **custom trajectory** you draw in a browser-based 3D previewer — with **gait-matched, slide-free** animation and correct **depth occlusion** against the 3DGS background.
 
-# 克隆本项目
-git clone https://github.com/<your-username>/adversarial_drive_studio.git
+Built for **autonomous driving robustness testing**: generate adversarial pedestrian scenarios at scale.
 
-# 运行安装脚本（自动复制脚本到 DriveStudio、下载角色资产）
-cd adversarial_drive_studio
-bash setup.sh
+## ✨ Features
+
+<table>
+<tr>
+<td width="50%" valign="top">
+
+### 🎮 Browser-based 3D Trajectory Editor
+
+Draw trajectories directly in the 3DGS scene. Real-time gsplat rendering via viser/nerfview.
+
+- Click to add waypoints
+- Dynamic obstacles (vehicles/pedestrians) move with time slider
+- Real-time 3D collision detection
+
+</td>
+<td width="50%" valign="top">
+
+### 👟 Gait-Matched Animation
+
+Never slide. Never overshoot. The step frequency is auto-computed from trajectory length and video duration.
+
+```
+length → steps → cycles → anim_speed
 ```
 
-安装脚本会：
-1. 将 `tools/` 下的脚本复制到 DriveStudio 的 `tools/` 目录
-2. 将 `configs/omnire_extended_cam.yaml` 复制到 DriveStudio 的 `configs/`
-3. 下载角色动画资产 `runner_seq.npz`（约 118MB）到 `outputs/assets/`
+</td>
+</tr>
+<tr>
+<td width="50%" valign="top">
 
-### 三步使用
+### 🎬 5-Camera + BEV Grid Rendering
+
+Waymo's 5 cameras tiled in a 3×2 grid with a BEV mini-map center cell. Depth-occluded compositing against the 3DGS background.
+
+</td>
+<td width="50%" valign="top">
+
+### 📦 Export & Visualization
+
+Export trained 3DGS checkpoints to standard PLY. Interactive viewers for both 3DGS scenes and PLY files.
+
+</td>
+</tr>
+</table>
+
+## Quick Start
+
+### Prerequisites
+
+1. [DriveStudio](https://github.com/ziyc/drivestudio) installed and configured
+2. A trained scene checkpoint (e.g., `outputs/waymo_omnire/scene23/checkpoint_final.pth`)
+3. Waymo processed data (e.g., `data/waymo/processed/training/023/`)
+
+### Install
+
+```bash
+# Inside your DriveStudio root directory
+cd /path/to/drivestudio
+
+git clone https://github.com/<your-username>/DriveHack.git
+cd DriveHack && bash setup.sh
+```
+
+That's it. `setup.sh` copies scripts, configs, and downloads character assets.
+
+### Usage (2 steps)
 
 ```bash
 cd /path/to/drivestudio
 conda activate drivestudio
 
-# 步骤 1：3D 预览器画轨迹（浏览器打开 localhost:8080）
+# 1️⃣ Draw trajectory in browser (open localhost:8080)
 python tools/trajectory_previewer.py \
     --resume_from outputs/waymo_omnire/scene23/checkpoint_final.pth \
     --scene_dir data/waymo/processed/training/023 \
     --port 8080
 
-# 步骤 2：在浏览器中画轨迹 → 点击 export → 生成 traj_live.json
-
-# 步骤 3：渲染视频
+# 2️⃣ Render the video
 python tools/render_runner_video.py \
     --resume_from outputs/waymo_omnire/scene23/checkpoint_final.pth \
     --path_json outputs/waymo_omnire/scene23/trajectories/traj_live.json \
     --out outputs/waymo_omnire/scene23/videos_eval/scene23_v3.mp4
 ```
 
-> 详细参数说明见 [docs/trajectory_pipeline.md](docs/trajectory_pipeline.md)
+> 📖 Full parameter reference: [docs/trajectory_pipeline.md](docs/trajectory_pipeline.md)
 
-## 项目结构
+## How It Works
 
 ```
-adversarial_drive_studio/
-├── setup.sh                         # 一键安装脚本
+┌──────────────────┐     ┌──────────────────┐     ┌──────────────────┐
+│  BEV Planner     │     │  3D Previewer    │     │  Video Renderer  │
+│  (matplotlib)    │ ──▶ │  (viser+gsplat)  │ ──▶ │  (nvdiffrast)    │
+│                  │     │                  │     │                  │
+│ • LiDAR + obs    │     │ • 3DGS live      │     │ • 5-cam + BEV    │
+│ • Click waypoints│     │ • Click in 3D    │     │ • Depth occlusion│
+│ • 2D collision   │     │ • Gait calc      │     │ • Gait-matched   │
+└──────────────────┘     └──────────────────┘     └──────────────────┘
+        ↓                        ↓                        ↓
+     traj.json             traj_live.json          scene_v3.mp4
+```
+
+### Gait Matching (No Foot Sliding)
+
+The character's step frequency is computed from physical parameters:
+
+| Parameter | Default | Meaning |
+|-----------|---------|---------|
+| `cycle_stride` | 2.6m | Distance per gait cycle (2 steps) |
+| `step_length` | 1.3m | Distance per single step |
+| `cycle_frames` | 20 | Animation frames per gait cycle |
+
+Given trajectory length `L` and `N` video frames:
+```
+anim_speed = (L / 2.6) × 20 / N
+```
+
+This guarantees the character takes exactly `L/1.3` steps, covering the entire trajectory with consistent stride — no sliding, no leftover, no overtime.
+
+## Project Structure
+
+```
+DriveHack/
+├── setup.sh                         # One-click installer
 ├── tools/
-│   ├── trajectory_previewer.py      # 3D 实时预览器（viser + nerfview + gsplat）
-│   ├── render_runner_video.py       # 最终视频渲染（nvdiffrast + gsplat）
-│   ├── bev_trajectory_planner.py    # BEV 轨迹规划（matplotlib）
-│   ├── gait_utils.py                # 步频计算模块
-│   ├── bake_runner_frames.py        # 角色动画烘焙（Blender，一次性）
-│   ├── export_gaussians_ply.py      # 导出 3DGS checkpoint 为 PLY
-│   ├── visualize_gaussian_ply.py    # PLY 交互式查看器
-│   └── viewer.py                    # 3DGS 场景查看器
+│   ├── trajectory_previewer.py      # 3D real-time preview (viser + nerfview)
+│   ├── render_runner_video.py       # Final video renderer (nvdiffrast)
+│   ├── bev_trajectory_planner.py    # BEV trajectory planner (matplotlib)
+│   ├── gait_utils.py                # Gait-matched speed calculator
+│   ├── bake_runner_frames.py        # Character animation baker (Blender)
+│   ├── export_gaussians_ply.py      # 3DGS checkpoint → PLY exporter
+│   ├── visualize_gaussian_ply.py    # Interactive PLY viewer
+│   └── viewer.py                    # 3DGS scene viewer
 ├── configs/
-│   └── omnire_extended_cam.yaml     # 五相机训练配置
+│   └── omnire_extended_cam.yaml     # 5-camera training config
 ├── docs/
-│   ├── trajectory_pipeline.md       # 完整 pipeline 文档
-│   └── adversarial_composition.md   # 技术细节文档
+│   ├── trajectory_pipeline.md       # Complete pipeline documentation
+│   └── adversarial_composition.md   # Technical details
 └── assets/
-    └── download_assets.sh           # 下载角色动画资产
+    └── download_assets.sh           # Character asset downloader
 ```
 
-## 各场景使用
+## Scene Index Reference
 
-场景编号对照（DriveStudio 输出目录 vs Waymo 数据目录）：
-
-| 场景 | checkpoint | 数据目录 |
-|------|-----------|----------|
+| Scene | Checkpoint | Data Directory |
+|-------|-----------|---------------|
 | scene23 | `outputs/waymo_omnire/scene23/` | `data/waymo/processed/training/023/` |
 | scene114 | `outputs/waymo_omnire/scene114/` | `data/waymo/processed/training/114/` |
 | scene552 | `outputs/waymo_omnire/scene552/` | `data/waymo/processed/training/552/` |
 
-## 技术要点
+## Acknowledgements
 
-### 步频匹配（不滑步）
+- [DriveStudio / OmniRe](https://github.com/ziyc/drivestudio) — 3DGS urban scene reconstruction
+- [Mixamo](https://www.mixamo.com/) — Character animations
+- [viser](https://github.com/nerfstudio-project/viser) / [nerfview](https://github.com/nerfstudio-project/nerfview) — 3D visualization
+- [nvdiffrast](https://github.com/NVlabs/nvdiffrast) — Mesh rasterization
 
-```
-轨迹长度 L → 总步数 = L / 1.3m
-           → 步态周期数 = L / 2.6m
-           → 动画总帧 = 周期数 × 20帧
-           → anim_speed = 动画总帧 / 视频帧数
-```
+## Citation
 
-角色恰好走完整个轨迹，每步 1.3m，动画周期与位移严格匹配。
+If you find this useful for your research:
 
-### 深度遮挡合成
-
-角色 mesh 用 nvdiffrast 光栅化，与 3DGS 背景的深度图做逐像素比较：
-- `mesh_depth < bg_depth` → 角色可见（被背景遮挡的部分自动隐藏）
-- 这样角色能被场景中的车辆、建筑正确遮挡
-
-### 坐标系
-
-- 场景 3DGS：ego-normalized 世界坐标系（Z-up，原点为第 0 帧 ego 位姿）
-- 角色动画：Z-up（脚 Z≈0，头 Z≈1.82）
-- 两者一致，无需额外转换
-
-## 依赖
-
-本项目依赖 DriveStudio 已安装的环境，额外需要：
-
-```
-nvdiffrast    # mesh 光栅化
-viser         # 网页查看器
-nerfview      # 3DGS 查看器
+```bibtex
+@misc{drivehack2026,
+  title  = {DriveHack: Injecting Adversarial Characters into 3DGS Driving Scenes},
+  author = {Your Name},
+  year   = {2026},
+  url    = {https://github.com/<your-username>/DriveHack}
+}
 ```
 
-这些已在 DriveStudio 的 conda 环境中预装。
+## License
 
-## 致谢
-
-- [DriveStudio / OmniRe](https://github.com/ziyc/drivestudio) — 3DGS 自动驾驶场景重建
-- [Mixamo](https://www.mixamo.com/) — 角色动画
+MIT

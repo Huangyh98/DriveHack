@@ -1,15 +1,15 @@
 #!/bin/bash
-# setup.sh — 一键安装 adversarial_drive_studio 到 DriveStudio
+# setup.sh — One-click installer: integrate DriveHack into DriveStudio
 #
-# 用法：
+# Usage:
 #   cd /path/to/drivestudio
-#   git clone https://github.com/<user>/adversarial_drive_studio.git
-#   cd adversarial_drive_studio && bash setup.sh
+#   git clone https://github.com/<user>/DriveHack.git
+#   cd DriveHack && bash setup.sh
 #
-# 功能：
-#   1. 将自研脚本复制到 DriveStudio 的 tools/ 目录
-#   2. 将配置文件复制到 configs/
-#   3. 下载角色动画资产 runner_seq.npz
+# What it does:
+#   1. Copies scripts to DriveStudio's tools/ directory
+#   2. Copies config to configs/
+#   3. Downloads character animation assets
 
 set -e
 
@@ -18,9 +18,9 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 DRIVESTUDIO_ROOT="$(dirname "$SCRIPT_DIR")"
 
 echo "=========================================="
-echo " Adversarial Drive Studio 安装脚本"
+echo " DriveHack Installer"
 echo "=========================================="
-echo "DriveStudio 根目录: $DRIVESTUDIO_ROOT"
+echo "DriveStudio root: $DRIVESTUDIO_ROOT"
 echo ""
 
 # 1. 检查 DriveStudio 目录
