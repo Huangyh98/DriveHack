@@ -174,6 +174,20 @@ DriveHack/
 | scene114 | `outputs/waymo_omnire/scene114/` | `data/waymo/processed/training/114/` |
 | scene552 | `outputs/waymo_omnire/scene552/` | `data/waymo/processed/training/552/` |
 
+## Custom Character (Blender Baking)
+
+Want to use your own character? Bake a Mixamo animation into the npz format:
+
+```bash
+~/blender/blender-4.4.3-linux-x64/blender --background \
+    --python tools/bake_runner_frames.py -- \
+    --blend your_character.blend \
+    --out outputs/assets/runner_seq.npz \
+    --frames 40
+```
+
+> 📖 Full guide: [docs/baking_guide.md](docs/baking_guide.md)
+
 ## Acknowledgements
 
 - [DriveStudio / OmniRe](https://github.com/ziyc/drivestudio) — 3DGS urban scene reconstruction
