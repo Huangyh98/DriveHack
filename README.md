@@ -137,7 +137,7 @@ Now install DriveHack on top:
 # Inside your DriveStudio root directory
 cd /path/to/drivestudio
 
-git clone https://github.com/<your-username>/DriveHack.git
+git clone https://github.com/Huangyh98/DriveHack.git
 cd DriveHack && bash setup.sh
 ```
 
@@ -288,9 +288,9 @@ If DriveHack is useful for your research:
 ```bibtex
 @misc{drivehack2026,
   title  = {DriveHack: Injecting Adversarial Characters into 3DGS Driving Scenes},
-  author = {Your Name},
+  author = {Yuanhao Huang},
   year   = {2026},
-  url    = {https://github.com/<your-username>/DriveHack}
+  url    = {https://github.com/Huangyh98/DriveHack}
 }
 ```
 
