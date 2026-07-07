@@ -15,6 +15,8 @@
   <a href="docs/trajectory_pipeline.md">Docs</a>
 </p>
 
+<img src="assets/banner.jpg" width="100%" alt="DriveHack Banner">
+
 <table>
 <tr>
 <td width="50%" align="center"><b>🎮 Trajectory Editor Demo</b><br><sub>Click in 3D scene to draw trajectory</sub></td>
