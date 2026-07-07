@@ -17,12 +17,18 @@
 
 <table>
 <tr>
-<td width="50%" align="center"><b>🎮 Trajectory Editor Demo</b></td>
-<td width="50%" align="center"><b>🎬 Rendered Output (5-cam + BEV)</b></td>
+<td width="50%" align="center"><b>🎮 Trajectory Editor Demo</b><br><sub>Click in 3D scene to draw trajectory</sub></td>
+<td width="50%" align="center"><b>🎬 Rendered Output (5-cam + BEV)</b><br><sub>Final video with depth occlusion</sub></td>
 </tr>
 <tr>
-<td width="50%"><video src="assets/trac_demo.mp4" controls width="100%"></video></td>
-<td width="50%"><video src="assets/scene23.mp4" controls width="100%"></video></td>
+<td width="50%" align="center">
+<a href="https://github.com/Huangyh98/DriveHack/raw/main/assets/trac_demo.mp4"><img src="assets/banner.jpg" width="100%" alt="Trajectory Editor Demo"></a>
+<br><a href="https://github.com/Huangyh98/DriveHack/raw/main/assets/trac_demo.mp4">▶️ Watch Demo</a>
+</td>
+<td width="50%" align="center">
+<a href="https://github.com/Huangyh98/DriveHack/raw/main/assets/scene23.mp4"><img src="assets/banner.jpg" width="100%" alt="Rendered Output"></a>
+<br><a href="https://github.com/Huangyh98/DriveHack/raw/main/assets/scene23.mp4">▶️ Watch Render</a>
+</td>
 </tr>
 </table>
 
