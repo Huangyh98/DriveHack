@@ -516,12 +516,8 @@ class BevMiniMap:
             cpts = [self._world_to_map(x, y)[:2] for x, y in self.char_traj]
             draw.line(cpts, fill=(46, 204, 113), width=2)
         # title
-        try:
-            from PIL import ImageFont
-            font = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", 16)
-            draw.text((8, 8), "BEV", fill=(255, 255, 0), font=font)
-        except Exception:
-            draw.text((8, 8), "BEV", fill=(255, 255, 0))
+        from tools.fonts import get_font
+        draw.text((8, 8), "BEV", fill=(255, 255, 0), font=get_font(16, bold=True))
         return img
 
     def render_frame(self, char_x, char_y, ego_idx=0):
@@ -681,8 +677,22 @@ def main(args) -> None:
             if isinstance(v, torch.Tensor):
                 cam_infos[k] = v.cuda(non_blocking=True)
         results = trainer(img_infos, cam_infos)
-        rgb = results["rgb"].clamp(0, 1).detach().cpu().numpy()
-        depth = results["depth"].detach().cpu().numpy().squeeze(-1)  # HxW meters
+        if getattr(args, "bg_only", False) and "Background_rgb" in results:
+            # static background only: Background_rgb * opacity + sky
+            bg_rgb = results["Background_rgb"]
+            bg_opa = results["Background_opacity"]
+            sky = results.get("rgb_sky", torch.zeros_like(bg_rgb))
+            rgb = (bg_rgb * bg_opa + sky * (1.0 - bg_opa)).clamp(0, 1).detach().cpu().numpy()
+            # CRITICAL: use Background_depth (not full depth) for occlusion test.
+            # Full depth contains original dynamic objects' depth, which would
+            # erroneously occlude the inserted pedestrian at old silhouette positions.
+            if "Background_depth" in results:
+                depth = results["Background_depth"].detach().cpu().numpy().squeeze(-1)
+            else:
+                depth = results["depth"].detach().cpu().numpy().squeeze(-1)
+        else:
+            rgb = results["rgb"].clamp(0, 1).detach().cpu().numpy()
+            depth = results["depth"].detach().cpu().numpy().squeeze(-1)  # HxW meters
         # Background-only depth (static scene, no cars/pedestrians) for ground Z
         if "Background_depth" in results:
             bg_depth = results["Background_depth"].detach().cpu().numpy().squeeze(-1)
@@ -707,14 +717,27 @@ def main(args) -> None:
     # Try reading gait params from trajectory JSON (written by trajectory_previewer)
     gait_from_json = None
     _traj_json_full = None  # full JSON dict (for top-level total_length)
+    _anim_mode = "run"
     if args.path_json:
         try:
             import json as _json
             _traj_json_full = _json.load(open(args.path_json))
             if "gait" in _traj_json_full:
                 gait_from_json = _traj_json_full["gait"]
+                _anim_mode = gait_from_json.get("anim_mode", "run")
         except Exception:
             pass
+
+    # "stand" mode freezes the character on a neutral frame regardless of the
+    # trajectory length (the baked run loop has no true idle pose, so we pick a
+    # mid-stance frame). This short-circuits all stride math below.
+    if _anim_mode == "stand":
+        args.anim_speed = 0.0
+        logger.info("Animation mode 'stand': character frozen in place "
+                    "(neutral frame), anim_speed=0")
+        # keep a stable neutral frame index for the render loops
+        from tools.gait_utils import neutral_anim_frame
+        args._neutral_anim_idx = neutral_anim_frame(n_anim)
 
     if args.stride > 0 and len(frame_ids) > 1:
         # Legacy: explicit --stride flag overrides everything
@@ -782,17 +805,78 @@ def main(args) -> None:
         logger.info("Using fixed anim_speed=%.2f (no gait matching)", args.anim_speed)
 
     if args.mode == "video":
-        render_video(args, get_scene, base_meshes, rast, n_anim, cam_ids, frame_ids, device)
+        if getattr(args, "multi_traj", ""):
+            logger.info("Multi-character mode: %d characters", len(load_multi_traj_config(args.multi_traj)))
+            render_video_multi(args, get_scene, base_meshes, rast, n_anim, cam_ids, frame_ids, device)
+        else:
+            render_video(args, get_scene, base_meshes, rast, n_anim, cam_ids, frame_ids, device)
     elif args.mode == "multicam_grid":
-        render_multicam_grid(args, get_scene, base_meshes, rast, n_anim, cam_ids, frame_ids, device)
+        if getattr(args, "multi_traj", ""):
+            chars = load_multi_traj_config(args.multi_traj)
+            logger.info("Multi-character mode: %d characters", len(chars))
+            render_multicam_grid_multi(args, get_scene, base_meshes, rast, n_anim, cam_ids, frame_ids, device, chars)
+        else:
+            render_multicam_grid(args, get_scene, base_meshes, rast, n_anim, cam_ids, frame_ids, device)
     else:
         render_multiview(args, get_scene, base_meshes, rast, n_anim, cam_ids, frame_ids, positions, clothes_tex_list, device, num_cams)
+
+
+class FrameSink:
+    """Crash-safe frame writer for video rendering.
+
+    In normal mode it writes straight to an mp4 via imageio (the legacy path).
+    With ``--resume`` it writes each frame as ``<out>_frames/frameNNNNNN.png``
+    and *skips frames that already exist* — so re-running after a crash picks
+    up where it left off. When done it muxes the PNGs back into the target mp4.
+    """
+
+    def __init__(self, out_path: str, fps: int, resume: bool):
+        self.out_path = out_path
+        self.fps = fps
+        self.resume = resume
+        self._writer = None
+        self._png_dir = None
+        if resume:
+            from pathlib import Path
+            p = Path(out_path)
+            self._png_dir = p.with_name(p.stem + "_frames")
+            self._png_dir.mkdir(parents=True, exist_ok=True)
+
+    def exists(self, oi: int) -> bool:
+        """True iff frame ``oi`` is already on disk (resume mode only)."""
+        if not self.resume or self._png_dir is None:
+            return False
+        return (self._png_dir / f"frame{oi:06d}.png").is_file()
+
+    def append(self, frame_u8, oi: int) -> None:
+        if self.resume and self._png_dir is not None:
+            imageio.imwrite(str(self._png_dir / f"frame{oi:06d}.png"), frame_u8)
+        else:
+            if self._writer is None:
+                self._writer = imageio.get_writer(self.out_path, mode="I", fps=self.fps)
+            self._writer.append_data(frame_u8)
+
+    def close(self) -> None:
+        """Finalize: close the mp4 writer, or mux PNGs into the target mp4."""
+        if self._writer is not None:
+            self._writer.close()
+        elif self.resume and self._png_dir is not None:
+            pngs = sorted(self._png_dir.glob("frame*.png"))
+            if not pngs:
+                logger.warning("resume: no frames written, skipping mux")
+                return
+            logger.info("resume: muxing %d PNGs -> %s", len(pngs), self.out_path)
+            w = imageio.get_writer(self.out_path, mode="I", fps=self.fps)
+            for p in pngs:
+                w.append_data(imageio.imread(str(p)))
+            w.close()
+            logger.info("resume: done (%s)", self.out_path)
 
 
 def render_video(args, get_scene, base_meshes, rast, n_anim, cam_ids, frame_ids, device):
     """Single-camera video with depth occlusion, ground anchoring, contact shadow."""
     cam_idx = cam_ids[0]
-    writer = imageio.get_writer(args.out, mode="I", fps=args.fps)
+    sink = FrameSink(args.out, args.fps, getattr(args, "resume", False))
 
     # Precompute character XY trajectory for ground Z table
     char_traj_xy = []
@@ -813,6 +897,8 @@ def render_video(args, get_scene, base_meshes, rast, n_anim, cam_ids, frame_ids,
         gz_table = np.full(len(frame_ids), args.ground_z)
 
     for oi, frame_idx in enumerate(frame_ids):
+        if sink.exists(oi):
+            continue  # resume: already rendered
         scene_rgb, scene_depth, scene_bg_depth, c2w, K, H, W, _ = get_scene(frame_idx, cam_idx)
         t = oi / max(1, len(frame_ids) - 1)
         if args.path_json:
@@ -827,7 +913,10 @@ def render_video(args, get_scene, base_meshes, rast, n_anim, cam_ids, frame_ids,
         position = (x, y, gz)
         # animation: advance ~1 anim cycle per ~1m of travel so stride matches
         # displacement. anim_speed here is anim-frames per output-frame.
-        anim_idx = int((oi * args.anim_speed) % n_anim)
+        # "stand" mode freezes on a neutral frame instead of frame 0.
+        anim_idx = getattr(args, "_neutral_anim_idx", None)
+        if anim_idx is None:
+            anim_idx = int((oi * args.anim_speed) % n_anim)
         M = build_world_transform(position, yaw, args.scale, feet_offset=args.feet_offset)
 
         composite = scene_rgb.copy()
@@ -857,11 +946,49 @@ def render_video(args, get_scene, base_meshes, rast, n_anim, cam_ids, frame_ids,
             composite = add_contact_shadow(composite, foot_px, radius=max(15.0, 30.0 * 8.0 / max(position[0], 1.0)))
 
         frame_u8 = (np.clip(composite, 0, 1) * 255).astype(np.uint8)
-        writer.append_data(frame_u8)
+        sink.append(frame_u8, oi)
         if oi % 10 == 0:
             logger.info("  video frame %d/%d pos=%s", oi, len(frame_ids), position)
-    writer.close()
+    sink.close()
     logger.info("Saved video to %s", args.out)
+
+
+def composite_character_into(
+    composite, scene_depth, base_meshes, rast, device,
+    position, yaw, anim_idx, scale, feet_offset,
+    c2w, K, H, W, clothes_textures=None,
+):
+    """Composite one character (all 3 meshes) into ``composite`` in place.
+
+    Returns ``(composite, char_mask, foot_px)``. This factors out the per-camera
+    rasterize → depth-occlude → shade → blend step so the multicam grid can
+    stamp multiple characters onto the same background (multi-character mode)
+    without duplicating the mesh loop.
+
+    ``clothes_textures`` (optional) is a dict {mesh_name: torch.Tensor} of
+    per-character texture overrides; missing names use the baked texture.
+    """
+    light_dir, ambient = estimate_light_direction(composite)
+    gz = position[2]
+    foot_world = np.array([position[0], position[1], gz, 1.0])
+    foot_cam = np.linalg.inv(c2w) @ foot_world
+    foot_px = (K[0, 0] * foot_cam[0] / foot_cam[2] + K[0, 2],
+               K[1, 1] * foot_cam[1] / foot_cam[2] + K[1, 2])
+    M = build_world_transform(position, yaw, scale, feet_offset=feet_offset)
+    char_mask = np.zeros((H, W), dtype=bool)
+    for name in MESH_NAMES:
+        m = base_meshes[name]
+        tex = (clothes_textures or {}).get(name, m["tex"])
+        verts_w = apply_transform(m["verts"][anim_idx].cpu().numpy(), M)
+        rgba, char_depth = rasterize_mesh(
+            rast, torch.from_numpy(verts_w).float().to(device),
+            m["faces"], m["uvs"], tex, c2w, K, H, W, device)
+        closer = (char_depth < scene_depth) & (rgba[..., 3] > 0.5)
+        alpha = closer[..., None].astype(np.float32)
+        rgb_layer = shade(rgba[..., :3], light_dir, ambient)
+        composite = composite * (1 - alpha) + rgb_layer * alpha
+        char_mask |= closer
+    return composite, char_mask, foot_px
 
 
 def render_multicam_grid(args, get_scene, base_meshes, rast, n_anim, cam_ids, frame_ids, device):
@@ -885,7 +1012,7 @@ def render_multicam_grid(args, get_scene, base_meshes, rast, n_anim, cam_ids, fr
     GRID_POS = {1: (0, 0), 0: (0, 1), 2: (0, 2), 3: (1, 0), 4: (1, 2)}
     grid_cols, grid_rows = 3, 2
 
-    writer = imageio.get_writer(args.out, mode="I", fps=args.fps)
+    sink = FrameSink(args.out, args.fps, getattr(args, "resume", False))
 
     # Precompute character's full trajectory XY for the BEV mini-map
     char_traj_xy = []
@@ -924,6 +1051,8 @@ def render_multicam_grid(args, get_scene, base_meshes, rast, n_anim, cam_ids, fr
         gz_table = np.full(len(frame_ids), args.ground_z)
 
     for oi, frame_idx in enumerate(frame_ids):
+        if sink.exists(oi):
+            continue  # resume: already rendered
         t = oi / max(1, len(frame_ids) - 1)
         if args.path_json:
             x, y = sample_traj_json(args.path_json, t)
@@ -937,7 +1066,9 @@ def render_multicam_grid(args, get_scene, base_meshes, rast, n_anim, cam_ids, fr
         gz = gz_table[oi]
         position = (x, y, gz)
 
-        anim_idx = int((oi * args.anim_speed) % n_anim)
+        anim_idx = getattr(args, "_neutral_anim_idx", None)
+        if anim_idx is None:
+            anim_idx = int((oi * args.anim_speed) % n_anim)
         M = build_world_transform(position, yaw, args.scale, feet_offset=args.feet_offset)
 
         # Render each camera view
@@ -970,13 +1101,11 @@ def render_multicam_grid(args, get_scene, base_meshes, rast, n_anim, cam_ids, fr
                 composite = add_contact_shadow(composite, foot_px, radius=max(15.0, 30.0 * 8.0 / max(position[0], 1.0)))
 
             # Add camera name label + tight 3D bounding box around character
-            from PIL import Image, ImageDraw, ImageFont
+            from PIL import Image, ImageDraw
+            from tools.fonts import get_font
             cam_pil = Image.fromarray((np.clip(composite, 0, 1) * 255).astype(np.uint8))
             draw = ImageDraw.Draw(cam_pil)
-            try:
-                font = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", 24)
-            except:
-                font = ImageFont.load_default()
+            font = get_font(24)
             label = CAMERA_NAMES.get(cam_idx, f"cam{cam_idx}")
             draw.text((10, 10), label, fill=(255, 255, 0), font=font)
             cam_frames.append(np.array(cam_pil))
@@ -1001,20 +1130,30 @@ def render_multicam_grid(args, get_scene, base_meshes, rast, n_anim, cam_ids, fr
             x_start, x_end = col * cell_w, (col + 1) * cell_w
             grid_frame[y_start:y_end, x_start:x_end] = np.array(pil)
 
-        # Place BEV mini-map in the center cell (row=1, col=1)
-        if bev_map is not None:
+        # Place BEV mini-map (or black CAM_BACK placeholder) in center cell (1,1)
+        y_start, y_end = 1 * cell_h, 2 * cell_h
+        x_start, x_end = 1 * cell_w, 2 * cell_w
+        if getattr(args, "bev_to_black", False):
+            # 6th view = CAM_BACK (black placeholder, no rear camera on Waymo)
+            grid_frame[y_start:y_end, x_start:x_end] = 0
+            from PIL import ImageDraw
+            from tools.fonts import get_font
+            tmp = PImage.fromarray(grid_frame[y_start:y_end, x_start:x_end])
+            d = ImageDraw.Draw(tmp)
+            fnt = get_font(24)
+            d.text((10, 10), "CAM_BACK", fill=(100, 100, 100), font=fnt)
+            grid_frame[y_start:y_end, x_start:x_end] = np.array(tmp)
+        elif bev_map is not None:
             ego_idx = min(frame_idx, len(bev_map.ego) - 1) if hasattr(bev_map, 'ego') else 0
             bev_img = bev_map.render_frame(position[0], position[1], ego_idx=ego_idx)
             bev_img = bev_img.resize((cell_w, cell_h), PImage.BILINEAR)
-            y_start, y_end = 1 * cell_h, 2 * cell_h
-            x_start, x_end = 1 * cell_w, 2 * cell_w
             grid_frame[y_start:y_end, x_start:x_end] = np.array(bev_img)
 
-        writer.append_data(np.ascontiguousarray(grid_frame))
+        sink.append(np.ascontiguousarray(grid_frame), oi)
         if oi % 10 == 0:
             logger.info("  multicam frame %d/%d pos=%s", oi, len(frame_ids), position)
 
-    writer.close()
+    sink.close()
     logger.info("Saved multicam grid video to %s", args.out)
 
 
@@ -1033,7 +1172,9 @@ def render_multiview(args, get_scene, base_meshes, rast, n_anim, cam_ids, frame_
             sub = out_dir / f"pos{pi:02d}_tex{ti:02d}"
             sub.mkdir(parents=True, exist_ok=True)
             for fi, frame_idx in enumerate(frame_ids):
-                anim_idx = int((frame_idx * args.anim_speed) % n_anim)
+                anim_idx = getattr(args, "_neutral_anim_idx", None)
+                if anim_idx is None:
+                    anim_idx = int((frame_idx * args.anim_speed) % n_anim)
                 for cam_idx in cam_ids:
                     scene_rgb, scene_depth, scene_bg_depth, c2w, K, H, W, cam_name = get_scene(frame_idx, cam_idx)
                     composite = scene_rgb.copy()
@@ -1061,8 +1202,232 @@ def render_multiview(args, get_scene, base_meshes, rast, n_anim, cam_ids, frame_
 
 
 # --------------------------------------------------------------------------- #
+# Multi-character rendering
+# --------------------------------------------------------------------------- #
+def _build_char_state(spec, args, get_scene, frame_ids, cam_idx, device, base_meshes):
+    """Precompute per-character trajectory, ground-Z table, textures, anim mode.
+
+    Mirrors the single-character setup so each injected character is treated
+    identically to a standalone render (own gait, own ground anchoring, own
+    optional clothing texture swap).
+    """
+    path_json = spec["path_json"]
+    from tools.gait_utils import AnimationMode, neutral_anim_frame
+    # anim mode + neutral frame (for "stand")
+    try:
+        mode = AnimationMode(spec.get("anim_mode", "run"))
+    except ValueError:
+        mode = AnimationMode.RUN
+    is_stand = mode.is_static
+    neutral_idx = neutral_anim_frame() if is_stand else None
+
+    # gait-matched anim_speed from this character's own JSON
+    import json as _json
+    tj = _json.load(open(path_json))
+    cycle_stride = tj.get("gait", {}).get("cycle_stride", spec.get("cycle_stride", 2.6))
+    path_len = tj.get("total_length", 0.0)
+    loop_len = 0
+    if path_len < 1e-6 and len(tj.get("trajectory", [])) > 1:
+        tr = np.asarray(tj["trajectory"])
+        path_len = float(np.sum(np.linalg.norm(np.diff(tr, axis=0), axis=1)))
+    n_cycles = path_len / cycle_stride if cycle_stride > 0 else 0
+    anim_speed = 0.0 if is_stand else (n_cycles * (20)) / max(1, len(frame_ids))
+
+    # XY trajectory for this character (with offset_t)
+    offset_t = spec.get("offset_t", 0.0)
+    char_traj_xy = []
+    for oi in range(len(frame_ids)):
+        tt = oi / max(1, len(frame_ids) - 1)
+        tt = (tt + offset_t) % 1.0
+        tx, ty = sample_traj_json(path_json, tt)
+        char_traj_xy.append((tx, ty))
+    char_traj_xy = np.array(char_traj_xy)
+
+    gz_table = (precompute_gz_table(get_scene, frame_ids, char_traj_xy, cam_idx, args.ground_z)
+                if args.adaptive_ground_z else np.full(len(frame_ids), args.ground_z))
+
+    # optional clothing texture override
+    clothes_tex = None
+    ct = spec.get("clothes_textures", "")
+    if ct:
+        tex_list = parse_texture_list(ct, base_meshes["clothes_1"]["tex"])
+        clothes_tex = {"clothes_1": tex_list[0]}
+
+    return {
+        "path_json": path_json, "scale": spec["scale"], "yaw_override": spec.get("yaw"),
+        "feet_offset": spec.get("feet_offset", args.feet_offset), "anim_mode": mode.value,
+        "neutral_idx": neutral_idx, "anim_speed": anim_speed, "char_traj_xy": char_traj_xy,
+        "gz_table": gz_table, "clothes_tex": clothes_tex,
+    }
+
+
+def render_video_multi(args, get_scene, base_meshes, rast, n_anim, cam_ids, frame_ids, device):
+    """Single-camera video with MULTIPLE characters composited per frame."""
+    cam_idx = cam_ids[0]
+    sink = FrameSink(args.out, args.fps, getattr(args, "resume", False))
+    chars = load_multi_traj_config(args.multi_traj)
+    states = [_build_char_state(s, args, get_scene, frame_ids, cam_idx, device, base_meshes)
+              for s in chars]
+    logger.info("Multi-character video: %d characters, %d frames", len(states), len(frame_ids))
+
+    for oi, frame_idx in enumerate(frame_ids):
+        if sink.exists(oi):
+            continue
+        scene_rgb, scene_depth, _, c2w, K, H, W, _ = get_scene(frame_idx, cam_idx)
+        composite = scene_rgb.copy()
+        n = max(1, len(frame_ids) - 1)
+        for idx, st in enumerate(states):
+            tt = (oi / n + chars[idx].get("offset_t", 0.0)) % 1.0
+            x, y = sample_traj_json(st["path_json"], tt)
+            yaw = (traj_json_yaw(st["path_json"], tt)
+                   if st["yaw_override"] is None else st["yaw_override"])
+            gz = st["gz_table"][oi]
+            ai = st["neutral_idx"] if st["neutral_idx"] is not None else int((oi * st["anim_speed"]) % n_anim)
+            composite, char_mask, foot_px = composite_character_into(
+                composite, scene_depth, base_meshes, rast, device,
+                (x, y, gz), yaw, ai, st["scale"], st["feet_offset"],
+                c2w, K, H, W, st["clothes_tex"])
+            if char_mask.any():
+                composite = add_contact_shadow(
+                    composite, foot_px,
+                    radius=max(15.0, 30.0 * 8.0 / max(x, 1.0)))
+        frame_u8 = (np.clip(composite, 0, 1) * 255).astype(np.uint8)
+        sink.append(frame_u8, oi)
+        if oi % 10 == 0:
+            logger.info("  multi video frame %d/%d", oi, len(frame_ids))
+    sink.close()
+    logger.info("Saved multi-character video to %s", args.out)
+
+
+def render_multicam_grid_multi(args, get_scene, base_meshes, rast, n_anim, cam_ids, frame_ids, device, chars):
+    """Multi-camera grid video with MULTIPLE characters composited per frame."""
+    GRID_POS = {1: (0, 0), 0: (0, 1), 2: (0, 2), 3: (1, 0), 4: (1, 2)}
+    grid_cols, grid_rows = 3, 2
+    cell_h, cell_w = 480, 640
+    from PIL import Image as PImage
+
+    sink = FrameSink(args.out, args.fps, getattr(args, "resume", False))
+    states = [_build_char_state(s, args, get_scene, frame_ids, cam_ids[0], device, base_meshes)
+              for s in chars]
+    # BEV mini-map uses the union of all characters' trajectories.
+    all_xy = np.concatenate([st["char_traj_xy"] for st in states], axis=0)
+    bev_map = None
+    config_path = os.path.join(os.path.dirname(args.resume_from), "config.yaml")
+    if os.path.exists(config_path):
+        cfg_data = OmegaConf.load(config_path).data
+        scene_dir = os.path.join(cfg_data.data_root, f"{int(cfg_data.scene_idx):03d}")
+        if os.path.isdir(scene_dir):
+            bev_map = BevMiniMap(scene_dir, all_xy, map_size=480)
+            logger.info("BEV mini-map enabled (multi-char, %d traj pts)", len(all_xy))
+    logger.info("Multi-character grid: %d characters, %d frames", len(states), len(frame_ids))
+
+    for oi, frame_idx in enumerate(frame_ids):
+        if sink.exists(oi):
+            continue
+        n = max(1, len(frame_ids) - 1)
+        cam_frames = []
+        for ci, cam_idx in enumerate(cam_ids):
+            scene_rgb, scene_depth, _, c2w, K, H, W, cam_name = get_scene(frame_idx, cam_idx)
+            composite = scene_rgb.copy()
+            for idx, st in enumerate(states):
+                tt = (oi / n + chars[idx].get("offset_t", 0.0)) % 1.0
+                x, y = sample_traj_json(st["path_json"], tt)
+                yaw = (traj_json_yaw(st["path_json"], tt)
+                       if st["yaw_override"] is None else st["yaw_override"])
+                gz = st["gz_table"][oi]
+                ai = st["neutral_idx"] if st["neutral_idx"] is not None else int((oi * st["anim_speed"]) % n_anim)
+                composite, char_mask, foot_px = composite_character_into(
+                    composite, scene_depth, base_meshes, rast, device,
+                    (x, y, gz), yaw, ai, st["scale"], st["feet_offset"],
+                    c2w, K, H, W, st["clothes_tex"])
+                if char_mask.any():
+                    composite = add_contact_shadow(
+                        composite, foot_px,
+                        radius=max(15.0, 30.0 * 8.0 / max(x, 1.0)))
+            from PIL import Image, ImageDraw
+            from tools.fonts import get_font
+            cam_pil = Image.fromarray((np.clip(composite, 0, 1) * 255).astype(np.uint8))
+            draw = ImageDraw.Draw(cam_pil)
+            draw.text((10, 10), CAMERA_NAMES.get(cam_idx, f"cam{cam_idx}"),
+                      fill=(255, 255, 0), font=get_font(24))
+            cam_frames.append(np.array(cam_pil))
+
+        grid_H, grid_W = cell_h * grid_rows, cell_w * grid_cols
+        grid_frame = np.zeros((grid_H, grid_W, 3), dtype=np.uint8)
+        for ci, cam_idx in enumerate(cam_ids):
+            if ci >= len(cam_frames):
+                break
+            pos = GRID_POS.get(cam_idx)
+            if pos is None:
+                continue
+            row, col = pos
+            pil = PImage.fromarray(cam_frames[ci]).resize((cell_w, cell_h), PImage.BILINEAR)
+            grid_frame[row * cell_h:(row + 1) * cell_h,
+                       col * cell_w:(col + 1) * cell_w] = np.array(pil)
+        y0, y1, x0, x1 = cell_h, 2 * cell_h, cell_w, 2 * cell_w
+        if getattr(args, "bev_to_black", False):
+            grid_frame[y0:y1, x0:x1] = 0
+            from PIL import ImageDraw
+            d = ImageDraw.Draw(PImage.fromarray(grid_frame[y0:y1, x0:x1]))
+            d.text((10, 10), "CAM_BACK", fill=(100, 100, 100), font=get_font(24))
+        elif bev_map is not None:
+            ego_idx = min(frame_idx, len(bev_map.ego) - 1) if hasattr(bev_map, 'ego') else 0
+            bev_img = bev_map.render_frame(states[0]["char_traj_xy"][oi][0],
+                                           states[0]["char_traj_xy"][oi][1], ego_idx=ego_idx)
+            grid_frame[y0:y1, x0:x1] = np.array(bev_img.resize((cell_w, cell_h), PImage.BILINEAR))
+
+        sink.append(np.ascontiguousarray(grid_frame), oi)
+        if oi % 10 == 0:
+            logger.info("  multi multicam frame %d/%d", oi, len(frame_ids))
+    sink.close()
+    logger.info("Saved multi-character grid video to %s", args.out)
+
+
+# --------------------------------------------------------------------------- #
 # CLI parsing helpers
 # --------------------------------------------------------------------------- #
+# Multi-character configuration
+# --------------------------------------------------------------------------- #
+def load_multi_traj_config(path: str) -> List[dict]:
+    """Load a multi-character injection config.
+
+    JSON schema (a list of per-character specs)::
+
+        [
+          {
+            "path_json": "outputs/.../traj_a.json",  # required
+            "scale": 0.90, "yaw": null, "offset_t": 0.0,
+            "clothes_textures": "", "anim_mode": "run"
+          },
+          { "path_json": ".../traj_b.json", "scale": 1.1 }
+        ]
+
+    ``offset_t`` shifts the character's normalized progress (e.g. 0.5 starts it
+    halfway along its trajectory at frame 0). ``yaw=null`` means "follow the
+    trajectory tangent" (the default). Missing keys take sensible defaults.
+    """
+    import json
+    cfg = json.load(open(path))
+    if isinstance(cfg, dict) and "characters" in cfg:
+        cfg = cfg["characters"]
+    if not isinstance(cfg, list) or not cfg:
+        raise ValueError(f"--multi_traj config must be a non-empty list: {path}")
+    out = []
+    for i, spec in enumerate(cfg):
+        if "path_json" not in spec:
+            raise ValueError(f"--multi_traj character {i} missing 'path_json'")
+        out.append({
+            "path_json": spec["path_json"],
+            "scale": float(spec.get("scale", 0.90)),
+            "yaw": spec.get("yaw"),  # None = follow tangent
+            "offset_t": float(spec.get("offset_t", 0.0)),
+            "clothes_textures": spec.get("clothes_textures", ""),
+            "anim_mode": spec.get("anim_mode", "run"),
+            "feet_offset": float(spec.get("feet_offset", 0.01)),
+        })
+    return out
+
+
 def parse_positions(spec: str) -> List[Tuple[float, float, float]]:
     """Parse 'x,y,z;x,y,z' into a list of positions. Empty -> single default."""
     if not spec or not spec.strip():
@@ -1137,11 +1502,20 @@ if __name__ == "__main__":
                              "2.6=1.3m/step. 0=auto from JSON gait or fixed anim_speed. "
                              "Priority: --stride > JSON gait > --cycle_stride > --anim_speed")
     parser.add_argument("--max_output_frames", type=int, default=0, help="video mode: cap frames; 0=all")
+    parser.add_argument("--resume", action="store_true",
+                        help="crash-safe rendering: write each frame as PNG to <out>_frames/ "
+                             "and skip already-rendered frames, then mux to mp4. "
+                             "Re-running after an interrupt picks up where it left off.")
     # multiview mode
     parser.add_argument("--out_dir", default="outputs/adversarial/", help="output dir (multiview mode)")
     parser.add_argument("--cameras", default="", help="comma-sep cam ids, e.g. 0,1,2 (empty=all)")
     parser.add_argument("--positions", default="", help="'x,y,z;x,y,z' placements (empty=default)")
     parser.add_argument("--clothes_textures", default="", help="';'-separated PNG paths (empty=original)")
+    parser.add_argument("--bg_only", action="store_true", help="render static background only (remove dynamic objects)")
+    parser.add_argument("--bev_to_black", action="store_true", help="replace BEV mini-map with black CAM_BACK (6th view)")
+    parser.add_argument("--multi_traj", default="",
+                        help="multi-character config JSON: list of {path_json,scale,yaw,offset_t,"
+                             "clothes_textures,anim_mode}. Overrides single-character --path/--path_json.")
     parser.add_argument("--frames", default="", help="comma-sep frame ids (empty=auto)")
     parser.add_argument("opts", nargs=argparse.REMAINDER, default=None)
     args = parser.parse_args()

@@ -23,13 +23,48 @@ This guarantees:
   - Animation plays through exactly the right number of gait cycles
 """
 import numpy as np
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from enum import Enum
 from typing import Optional
 
 
 # Animation constants (from runner_seq.npz)
 N_ANIM_FRAMES = 40          # total animation frames in runner_seq.npz
 CYCLE_FRAMES = 20           # frames per gait cycle (left+right step). n_anim//2
+
+
+class AnimationMode(str, Enum):
+    """Character locomotion presets.
+
+    Each mode maps to a recommended ``cycle_stride`` (meters per gait cycle =
+    two steps). The same baked run-loop animation (runner_seq.npz) is reused
+    for all moving modes — only the playback speed (anim_speed) changes, so a
+    shorter stride yields a faster-looking step frequency and a "walk" feel.
+    ``stand`` freezes the character in place on a neutral frame.
+    """
+
+    RUN = "run"
+    JOG = "jog"
+    WALK = "walk"
+    STAND = "stand"
+
+    @property
+    def cycle_stride(self) -> float:
+        # Empirical per-cycle distances; tuned to land on natural human cadence.
+        return {
+            "run": 2.6,    # 1.3 m/step — full running stride
+            "jog": 2.0,    # 1.0 m/step — easy jog
+            "walk": 1.2,   # 0.6 m/step — brisk walk
+            "stand": 0.0,  # in-place, no travel
+        }[self.value]
+
+    @property
+    def is_static(self) -> bool:
+        return self == AnimationMode.STAND
+
+
+# Default mode used when none is specified (preserves original behavior).
+DEFAULT_MODE = AnimationMode.RUN
 
 
 @dataclass
@@ -46,10 +81,12 @@ class GaitParams:
     char_speed: float              # character ground speed (m/s)
     step_freq: float               # steps per second
     video_duration: float          # seconds
+    anim_mode: str = "run"         # locomotion mode label (run/jog/walk/stand)
 
     def summary(self) -> str:
         """One-line human-readable summary."""
         return (
+            f"mode={self.anim_mode}  "
             f"len={self.trajectory_length:.1f}m  "
             f"steps={self.n_steps:.0f}  "
             f"speed={self.char_speed:.1f}m/s  "
@@ -60,6 +97,7 @@ class GaitParams:
     def detail(self) -> str:
         """Multi-line detailed report."""
         return (
+            f"  动画模式:    {self.anim_mode}\n"
             f"  轨迹长度:    {self.trajectory_length:.2f} m\n"
             f"  步长参数:    {self.step_length:.2f} m/步 (周期 {self.cycle_stride:.1f}m = 2步)\n"
             f"  总步数:      {self.n_steps:.1f} 步 ({self.n_cycles:.1f} 个步态周期)\n"
@@ -94,6 +132,7 @@ def compute_gait_params(
     fps: float = 10.0,
     cycle_stride: float = 2.6,
     cycle_frames: int = CYCLE_FRAMES,
+    mode: str = "run",
 ) -> GaitParams:
     """Compute animation speed for gait-matched, slide-free motion.
 
@@ -103,10 +142,34 @@ def compute_gait_params(
         fps: video frame rate.
         cycle_stride: meters covered per gait cycle (2 steps). Default 2.6m.
         cycle_frames: animation frames per gait cycle. Default 20.
+        mode: locomotion mode label ("run"/"jog"/"walk"/"stand"). Stored on the
+            result; for "stand" the character is frozen in place regardless of
+            trajectory length.
 
     Returns:
         GaitParams with all computed values.
     """
+    # Resolve mode; if the caller passed the default cycle_stride but a named
+    # mode, adopt that mode's recommended stride (unless they overrode it).
+    try:
+        anim_mode = AnimationMode(mode)
+    except ValueError:
+        anim_mode = AnimationMode.RUN
+
+    # "stand": character frozen on a neutral frame; no travel.
+    if anim_mode.is_static:
+        video_duration = n_video_frames / fps if fps > 0 else 0
+        return GaitParams(
+            trajectory_length=trajectory_length,
+            cycle_stride=0.0,
+            step_length=0.0,
+            n_steps=0.0, n_cycles=0.0,
+            n_video_frames=n_video_frames, fps=fps,
+            anim_speed=0.0, char_speed=0.0,
+            step_freq=0.0, video_duration=video_duration,
+            anim_mode="stand",
+        )
+
     if trajectory_length < 1e-6 or n_video_frames < 1:
         return GaitParams(
             trajectory_length=trajectory_length,
@@ -116,6 +179,7 @@ def compute_gait_params(
             n_video_frames=n_video_frames, fps=fps,
             anim_speed=0.0, char_speed=0.0,
             step_freq=0.0, video_duration=n_video_frames / fps if fps > 0 else 0,
+            anim_mode=anim_mode.value,
         )
 
     step_length = cycle_stride / 2.0        # meters per single step
@@ -139,4 +203,45 @@ def compute_gait_params(
         char_speed=char_speed,
         step_freq=step_freq,
         video_duration=video_duration,
+        anim_mode=anim_mode.value,
     )
+
+
+def compute_animation_for_mode(
+    mode,
+    trajectory_length: float,
+    n_video_frames: int,
+    fps: float = 10.0,
+    cycle_frames: int = CYCLE_FRAMES,
+) -> GaitParams:
+    """Compute gait params for a named animation mode.
+
+    Picks the mode's recommended ``cycle_stride`` and delegates to
+    :func:`compute_gait_params`. This is the convenience entry point used by
+    the trajectory previewer's mode dropdown and by the renderer when a JSON
+    trajectory carries an ``anim_mode`` field.
+
+    ``mode`` may be an :class:`AnimationMode` or its string value.
+    """
+    try:
+        anim_mode = AnimationMode(mode) if not isinstance(mode, AnimationMode) else mode
+    except ValueError:
+        anim_mode = AnimationMode.RUN
+    return compute_gait_params(
+        trajectory_length=trajectory_length,
+        n_video_frames=n_video_frames,
+        fps=fps,
+        cycle_stride=anim_mode.cycle_stride,
+        cycle_frames=cycle_frames,
+        mode=anim_mode.value,
+    )
+
+
+def neutral_anim_frame(n_anim: int = N_ANIM_FRAMES) -> int:
+    """A neutral mid-stance frame for the "stand" (in-place) mode.
+
+    Frame ~10 in the 40-frame run loop is roughly mid-stance (weight on one
+    leg, the other passing through). Used so a frozen character looks like it
+    is standing/walking in place rather than frozen mid-stride.
+    """
+    return min(max(n_anim // 4, 0), max(n_anim - 1, 0))

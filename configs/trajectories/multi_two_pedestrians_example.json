@@ -1,0 +1,19 @@
+{
+  "_comment": "Example multi-character config for render_runner_video.py --multi_traj. Two pedestrians cross the road from opposite sides at slightly offset times. Adapt the path_json values to your exported trajectories.",
+  "characters": [
+    {
+      "path_json": "outputs/waymo_omnire/scene23/trajectories/traj_live.json",
+      "scale": 0.90,
+      "anim_mode": "walk",
+      "offset_t": 0.0,
+      "yaw": null
+    },
+    {
+      "path_json": "outputs/waymo_omnire/scene23/trajectories/traj_jaywalk.json",
+      "scale": 0.90,
+      "anim_mode": "walk",
+      "offset_t": 0.15,
+      "clothes_textures": ""
+    }
+  ]
+}

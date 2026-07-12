@@ -51,7 +51,10 @@ Built for **autonomous driving robustness testing**: generate adversarial pedest
 | 🎮 | **Browser-based 3D Trajectory Editor** | Draw trajectories directly in the 3DGS scene. Real-time gsplat rendering via viser/nerfview. |
 | 🚗 | **Dynamic Obstacles** | Vehicles/pedestrians/cyclists move with the time slider. Time-synchronized 3D collision detection. |
 | 👟 | **Gait-Matched Animation** | Never slide. Never overshoot. Step frequency auto-computed from trajectory length & video duration. |
-| 🎬 | **5-Camera + BEV Grid Rendering** | Waymo's 5 cameras tiled 3×2 with a BEV mini-map. Depth-occluded compositing. |
+| 🚶 | **Animation Modes** | Walk / jog / run / stand presets with stride-matched cadence. |
+| 👥 | **Multi-Character Injection** | Drop several characters (each with its own trajectory, gait, scale, texture) into one scene. |
+| 🎬 | **5-Camera + BEV Grid Rendering** | Waymo's 5 cameras tiled 3×2 with a BEV mini-map. Depth-occluded compositing. Crash-safe `--resume`. |
+| 📚 | **Trajectory Library & Batch Render** | Reusable trajectory JSONs + one-command rendering across many scenes. |
 | 🧊 | **Custom Characters** | Bake any Mixamo character with Blender. |
 | 📦 | **Export & Visualization** | Export 3DGS checkpoints to PLY. Interactive viewers for scenes and PLY files. |
 
@@ -191,6 +194,18 @@ python tools/render_runner_video.py \
 
 Done! Output is a 3×2 grid: 5 camera views + BEV mini-map, with the character depth-occluded by the scene.
 
+<details>
+<summary><b>⚙️ More options (click to expand)</b></summary>
+
+- **Animation modes** — in the previewer's "步频参数" panel pick `walk`/`jog`/`run`/`stand`; the mode is saved to the trajectory JSON and auto-applied on render.
+- **Multiple characters** — `--multi_traj config.json` injects several characters (each with its own trajectory/gait/scale/texture). Generate the config in the previewer (`export multi_config.json`) or by hand.
+- **Crash-safe render** — add `--resume` to render frame-by-frame to PNGs and resume after an interrupt.
+- **Batch across scenes** — `python tools/batch_render_scenes.py --scenes 23,114,552 --traj jaywalk`.
+
+> 📖 Details: [docs/trajectory_pipeline.md](docs/trajectory_pipeline.md#进阶动画模式-walk--jog--run--stand)
+
+</details>
+
 > 📖 Full parameter reference: [docs/trajectory_pipeline.md](docs/trajectory_pipeline.md)
 
 ## 🧊 Custom Character Baking
@@ -249,13 +264,17 @@ DriveHack/
 │   ├── trajectory_previewer.py      # 🎮 3D real-time preview (viser + nerfview)
 │   ├── render_runner_video.py       # 🎬 Final video renderer (nvdiffrast)
 │   ├── bev_trajectory_planner.py    # 🗺️ BEV trajectory planner (matplotlib)
-│   ├── gait_utils.py                # 👟 Gait-matched speed calculator
+│   ├── gait_utils.py                # 👟 Gait-matched speed + animation modes
+│   ├── batch_render_scenes.py       # 📚 Batch render across scenes
+│   ├── scene_utils.py               # 🧭 Scene-dir resolution (zero-pad safe)
+│   ├── fonts.py                     # 🔤 Cross-platform font loading
 │   ├── bake_runner_frames.py        # 🧊 Character animation baker (Blender)
 │   ├── export_gaussians_ply.py      # 📦 3DGS checkpoint → PLY exporter
 │   ├── visualize_gaussian_ply.py    # 👁️ Interactive PLY viewer
 │   └── viewer.py                    # 🖥️ 3DGS scene viewer
 ├── configs/
-│   └── omnire_extended_cam.yaml     # 5-camera training config
+│   ├── omnire_extended_cam.yaml     # 5-camera training config
+│   └── trajectories/                # Reusable trajectory library
 ├── docs/
 │   ├── trajectory_pipeline.md       # Complete pipeline docs
 │   ├── baking_guide.md              # Blender baking guide

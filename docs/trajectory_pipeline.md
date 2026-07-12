@@ -250,10 +250,132 @@ DriveStudio 输出目录和 Waymo 数据目录的编号可能不同位数：
 
 ---
 
+## 进阶：动画模式（walk / jog / run / stand）
+
+预览器右侧"步频参数"面板的**动画模式**下拉框可切换角色运动方式：
+
+| 模式 | 周期步幅 | 每步 | 说明 |
+|------|---------|------|------|
+| `run`（默认） | 2.6m | 1.3m | 快跑 |
+| `jog` | 2.0m | 1.0m | 慢跑 |
+| `walk` | 1.2m | 0.6m | 步行（步频更快，步幅更小） |
+| `stand` | — | — | 原地站立（冻结在单帧） |
+
+切换模式会自动设定推荐步幅，并实时更新步频评估。模式会写入导出 JSON 的 `gait.anim_mode` 字段，渲染器自动读取——无需手动传参。
+
+> **注意**：所有模式复用同一个 `runner_seq.npz` 跑步动画；模式仅改变播放速度（步频/步幅），而非动画本身。`stand` 模式冻结在中性帧（非第 0 帧的触地瞬间）。
+
+```bash
+# 在预览器里选 walk，导出后渲染即为步行效果
+python tools/trajectory_previewer.py \
+    --resume_from outputs/waymo_omnire/scene23/checkpoint_final.pth \
+    --scene_dir data/waymo_processed/training/023 --anim_mode walk
+```
+
+---
+
+## 进阶：多角色注入
+
+可同时在场景里注入多个角色（各自独立轨迹、步频、缩放、纹理）。
+
+**方式 1：预览器里画**
+
+```bash
+python tools/trajectory_previewer.py \
+    --resume_from outputs/waymo_omnire/scene23/checkpoint_final.pth \
+    --scene_dir data/waymo/processed/training/023 \
+    --extra_traj outputs/waymo_omnire/scene23/trajectories/traj_jaywalk.json
+```
+
+主轨迹（绿色，可点击编辑）+ 额外轨迹（蓝/橙色，只读）。画好后点 `export multi_config.json` 生成多角色配置。
+
+**方式 2：手写配置**
+
+```json
+{
+  "characters": [
+    {"path_json": ".../traj_a.json", "scale": 0.90, "anim_mode": "walk", "offset_t": 0.0},
+    {"path_json": ".../traj_b.json", "scale": 1.1, "anim_mode": "run", "offset_t": 0.15}
+  ]
+}
+```
+
+`offset_t` 错开角色出发时机（0.15 = 第二个角色延迟 15% 进度出发）。见 `configs/trajectories/multi_two_pedestrians_example.json`。
+
+**渲染：**
+
+```bash
+python tools/render_runner_video.py \
+    --resume_from outputs/waymo_omnire/scene23/checkpoint_final.pth \
+    --multi_traj outputs/waymo_omnire/scene23/trajectories/multi_config.json \
+    --out outputs/waymo_omnire/scene23/videos_eval/scene23_multi.mp4
+```
+
+每个角色独立计算地面高度和步频，背景只渲染一次后多角色依次叠加。
+
+---
+
+## 进阶：批量渲染
+
+`tools/batch_render_scenes.py` 对多个场景批量渲染：
+
+```bash
+# 3 个场景，用轨迹库里的 jaywalk，干跑预览命令
+python tools/batch_render_scenes.py --scenes 23,114,552 --traj jaywalk --dry_run
+
+# 实际渲染（含中断恢复）
+python tools/batch_render_scenes.py --scenes 23,114,552 --traj jaywalk --resume
+```
+
+| 参数 | 说明 |
+|------|------|
+| `--scenes` | 逗号分隔场景号 |
+| `--scenes_file` | 每行一个场景号的文件 |
+| `--traj` | 轨迹库名（`configs/trajectories/`）或路径 |
+| `--traj_path` | 直接指定轨迹 JSON（覆盖 `--traj`） |
+| `--mode` | 渲染模式（默认 `multicam_grid`） |
+| `--resume` | 中断恢复 |
+| `--dry_run` | 只打印命令不执行 |
+
+脚本自动处理 scene23↔023 的零填充问题，缺 checkpoint/数据目录的场景会被跳过并告警。
+
+---
+
+## 进阶：渲染中断恢复（--resume）
+
+长视频渲染中途崩溃时，加 `--resume` 可从断点续渲：
+
+```bash
+python tools/render_runner_video.py \
+    --resume_from .../checkpoint_final.pth \
+    --path_json .../traj_live.json \
+    --out .../scene23.mp4 --resume
+```
+
+- 启用后每帧落盘为 `<out>_frames/frameNNNNNN.png`
+- 重跑时自动跳过已存在帧
+- 全部完成后自动 mux 成目标 mp4
+- 默认关闭（不加 `--resume` 时直接写 mp4，行为不变）
+
+---
+
+## 进阶：轨迹库
+
+`configs/trajectories/` 存放可复用的轨迹 JSON（含 `gait` 参数）。轨迹库里的轨迹是**模式**（相对坐标），不是绝对路径——加载到预览器里按自己场景调整路点后再导出。
+
+| 文件 | 模式 | 长度 |
+|------|------|------|
+| `jaywalk_cross_scene23.json` | 横穿马路 | 8.0m |
+| `multi_two_pedestrians_example.json` | 双角色配置示例 | — |
+
+详见 `configs/trajectories/README.md`。
+
+---
+
 ## 常见问题
 
 ### Q: 角色不动 / 静止
-**A**: JSON 的 gait 字段未被正确读取。检查 `traj_live.json` 是否含 `gait` 字段和顶层 `total_length`。重新在预览器中 export。
+**A**: JSON 的 gait 字段未被正确读取。检查 `traj_live.json` 是否含 `gait` 字段和顶层 `total_length`。重新在预览器中 export。若 `anim_mode=stand` 则是有意冻结。
 
 ### Q: 角色没跑完轨迹就结束了
 **A**: 去掉 `--max_output_frames`（或设为 0）。步频匹配已确保角色在全部帧内走完。

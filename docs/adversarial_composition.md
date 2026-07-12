@@ -217,6 +217,10 @@ PYTHONPATH=$(pwd) python tools/render_runner_video.py \
 | `--scale` | 1.0 | 人物缩放（0.90 ≈ 1.64m） |
 | `--positions` | 默认 | multiview 模式放置位置 `x,y,z;x,y,z` |
 | `--clothes_textures` | 原纹理 | 衣服纹理 PNG 路径，`;` 分隔 |
+| `--bg_only` | False | 只渲染静态背景（移除动态车辆/行人）。用 `Background_depth` 做遮挡，避免角色被旧动态物轮廓误挡 |
+| `--bev_to_black` | False | 把 multicam_grid 中心格的 BEV 小地图替换为黑色 `CAM_BACK` 占位（凑 6 视角） |
+| `--multi_traj` | 空 | 多角色配置 JSON：`[{path_json,scale,yaw,offset_t,clothes_textures,anim_mode}]`。覆盖单角色 `--path`/`--path_json` |
+| `--resume` | False | 中断恢复：每帧落盘 PNG 到 `<out>_frames/`，重跑跳过已存在帧，完成后 mux 成 mp4 |
 | `--frames` | 自动 | 指定场景帧 ID |
 
 ### 深度遮挡

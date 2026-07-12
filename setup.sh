@@ -51,6 +51,11 @@ mkdir -p "$DRIVESTUDIO_ROOT/configs"
 for f in configs/*.yaml; do
     cp -v "$f" "$DRIVESTUDIO_ROOT/configs/"
 done
+# 复制轨迹库（configs/trajectories/*.json + README）
+if [ -d "configs/trajectories" ]; then
+    mkdir -p "$DRIVESTUDIO_ROOT/configs/trajectories"
+    cp -v configs/trajectories/* "$DRIVESTUDIO_ROOT/configs/trajectories/" 2>/dev/null || true
+fi
 
 # 4. 下载角色资产
 echo ""

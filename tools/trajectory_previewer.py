@@ -46,7 +46,9 @@ from omegaconf import OmegaConf
 
 from datasets.driving_dataset import DrivingDataset
 from utils.misc import import_str
-from tools.gait_utils import compute_gait_params, GaitParams
+from tools.gait_utils import (
+    compute_gait_params, compute_animation_for_mode, GaitParams, AnimationMode,
+)
 
 
 # ========================================================================= #
@@ -198,6 +200,9 @@ def main():
                         help="e.g. data/waymo/processed/training/023")
     parser.add_argument("--path_json", default=None,
                         help="load existing trajectory for editing")
+    parser.add_argument("--extra_traj", action="append", default=[],
+                        help="additional trajectory JSON to visualize alongside the "
+                             "main one (multi-character). May be given multiple times.")
     parser.add_argument("--port", type=int, default=8080)
     parser.add_argument("--char_size", default="0.6,0.4,1.8",
                         help="character bbox W,D,H meters")
@@ -208,6 +213,12 @@ def main():
                         help="max dynamic obstacles to show (perf limit)")
     parser.add_argument("--cycle_stride", type=float, default=2.6,
                         help="meters per gait cycle (2 steps). 2.6m = 1.3m/step")
+    parser.add_argument("--anim_mode", default="run",
+                        choices=[m.value for m in AnimationMode],
+                        help="locomotion preset (run/jog/walk/stand); sets a "
+                             "recommended cycle_stride unless overridden")
+    parser.add_argument("--out_json", default=None,
+                        help="export path (default: next to checkpoint)")
     args = parser.parse_args()
 
     log_dir = os.path.dirname(args.resume_from)
@@ -232,9 +243,35 @@ def main():
         d = json.load(open(args.path_json))
         waypoints = [list(w) for w in d["waypoints"]]
         print(f"  loaded {len(waypoints)} waypoints from {args.path_json}")
+        # restore animation mode from a previously-exported trajectory
+        gait = d.get("gait", {})
+        if gait.get("anim_mode"):
+            try:
+                args.anim_mode = AnimationMode(gait["anim_mode"]).value
+            except ValueError:
+                pass
     else:
         waypoints = []
+    # Adopt the selected mode's recommended stride unless the user explicitly
+    # overrode --cycle_stride on the command line.
+    try:
+        _mode = AnimationMode(args.anim_mode)
+    except ValueError:
+        _mode = AnimationMode.RUN
+    if not _mode.is_static and args.cycle_stride == 2.6 and _mode != AnimationMode.RUN:
+        args.cycle_stride = _mode.cycle_stride
     traj = catmull_rom_spline(np.array(waypoints), 300) if len(waypoints) >= 2 else np.zeros((0, 2))
+
+    # Load extra (secondary) trajectories for multi-character preview. These are
+    # read-only visualizations alongside the editable main trajectory.
+    extra_trajs = []
+    for ep in args.extra_traj:
+        if os.path.exists(ep):
+            ed = json.load(open(ep))
+            et = np.asarray(ed.get("trajectory", []))
+            if len(et) >= 2:
+                extra_trajs.append({"path": ep, "traj": et, "scale": ed.get("gait", {}).get("scale", 0.9)})
+                print(f"  loaded extra trajectory from {ep} ({len(et)} pts)")
 
     # 2. Build trainer
     print("[2/3] Loading DriveStudio checkpoint...")
@@ -304,6 +341,18 @@ def main():
                 f"wp_{i}", radius=0.3,
                 position=(wp[0], wp[1], args.ground_z + 0.1),
                 color=(255, 200, 0))
+        # render extra (multi-character) trajectories in distinct colors
+        extra_colors = [(0.0, 0.6, 1.0), (1.0, 0.5, 0.0), (0.8, 0.2, 0.8), (0.2, 0.9, 0.9)]
+        for ei, et in enumerate(extra_trajs):
+            server.scene.remove_by_name(f"extra_traj_{ei}")
+            t = et["traj"]
+            if len(t) >= 2:
+                pts = np.column_stack([t, np.full(len(t), args.ground_z + 0.05)])
+                c = extra_colors[ei % len(extra_colors)]
+                server.scene.add_line_segments(
+                    f"extra_traj_{ei}", points=pts.reshape(-1, 2, 3),
+                    colors=np.array([[c] * len(pts)]).reshape(-1, 2, 3),
+                    line_width=2.5)
         update_length_label()
 
     # ---- Dynamic obstacles (rebuilt on frame change) ----
@@ -369,9 +418,10 @@ def main():
             n_video_frames=n_frames,
             fps=args.render_fps,
             cycle_stride=args.cycle_stride,
+            mode=args.anim_mode,
         )
         text = (
-            f"len={gp.trajectory_length:.1f}m  "
+            f"[{gp.anim_mode}] len={gp.trajectory_length:.1f}m  "
             f"steps={gp.n_steps:.0f}  "
             f"speed={gp.char_speed:.1f}m/s  "
             f"anim_speed={gp.anim_speed:.2f}  "
@@ -382,7 +432,7 @@ def main():
             position=(0, 0, args.ground_z + 8))
         # Update GUI text with detailed info
         gui_gait_info.value = (
-            f"len={gp.trajectory_length:.1f}m | "
+            f"[{gp.anim_mode}] len={gp.trajectory_length:.1f}m | "
             f"{gp.n_steps:.0f}步 | "
             f"{gp.char_speed:.1f}m/s | "
             f"步频{gp.step_freq:.1f}Hz | "
@@ -443,11 +493,18 @@ def main():
             "sync frame to traj", initial_value=True,
             hint="auto-set scene frame based on trajectory progress")
         gui_export = server.gui.add_button("export traj.json")
+        gui_export_multi = server.gui.add_button(
+            "export multi_config.json", disabled=len(extra_trajs) == 0)
 
     # ---- Gait parameters folder ----
     gait_folder = server.gui.add_folder("步频参数 (Gait)")
 
     with gait_folder:
+        gui_anim_mode = server.gui.add_dropdown(
+            "动画模式", options=[m.value for m in AnimationMode],
+            initial_value=args.anim_mode,
+            hint="run=快跑 / jog=慢跑 / walk=步行 / stand=原地站立。"
+                 "切换会自动设推荐步幅。")
         gui_cycle_stride = server.gui.add_slider(
             "步态周期步幅(m)", min=1.0, max=4.0, step=0.1,
             initial_value=args.cycle_stride,
@@ -492,6 +549,20 @@ def main():
         args.cycle_stride = gui_cycle_stride.value
         rebuild_trajectory()  # recalculates length label
 
+    @gui_anim_mode.on_update
+    def _on_anim_mode(event):
+        args.anim_mode = gui_anim_mode.value
+        try:
+            mode = AnimationMode(args.anim_mode)
+        except ValueError:
+            mode = AnimationMode.RUN
+        # adopting a mode sets its recommended stride (unless stand, which
+        # keeps the slider but reports a frozen character)
+        if not mode.is_static:
+            gui_cycle_stride.value = mode.cycle_stride
+            args.cycle_stride = mode.cycle_stride
+        rebuild_trajectory()
+
     @gui_undo.on_click
     def _on_undo(event):
         if state["waypoints"]:
@@ -515,7 +586,8 @@ def main():
         tl = trajectory_length(traj)
         gp = compute_gait_params(
             trajectory_length=tl, n_video_frames=n_frames,
-            fps=args.render_fps, cycle_stride=args.cycle_stride)
+            fps=args.render_fps, cycle_stride=args.cycle_stride,
+            mode=args.anim_mode)
         out = {
             "waypoints": state["waypoints"],
             "trajectory": traj.tolist(),
@@ -523,6 +595,7 @@ def main():
             "colliding_samples": 0,
             # Gait-matched parameters for render_runner_video.py
             "gait": {
+                "anim_mode": gp.anim_mode,
                 "cycle_stride": gp.cycle_stride,
                 "step_length": gp.step_length,
                 "n_steps": round(gp.n_steps, 1),
@@ -535,12 +608,45 @@ def main():
                 "video_duration": round(gp.video_duration, 2),
             },
         }
-        out_path = f"outputs/waymo_omnire/scene{cfg.data.scene_idx}/trajectories/traj_live.json"
+        # Default export path lives next to the checkpoint (matches the rest of
+        # the pipeline); --out_json overrides it.
+        from tools.scene_utils import default_out_json
+        out_path = args.out_json or str(default_out_json(args.resume_from))
         os.makedirs(os.path.dirname(out_path), exist_ok=True)
         json.dump(out, open(out_path, "w"), indent=2)
         print(f"  exported to {out_path}")
         print(gp.detail())
         print(f"  → 渲染命令加: --anim_speed {gp.anim_speed:.3f}")
+
+    @gui_export_multi.on_click
+    def _on_export_multi(event):
+        """Write a multi-character config referencing the main + extra trajectories."""
+        if len(state["waypoints"]) < 2 and not extra_trajs:
+            print("  need a main trajectory and/or --extra_traj to export multi config")
+            return
+        from tools.scene_utils import default_out_json
+        base = Path(args.out_json or default_out_json(args.resume_from))
+        # ensure the main traj is exported first
+        if len(state["waypoints"]) >= 2:
+            tl = trajectory_length(state["traj"])
+            gp = compute_gait_params(
+                trajectory_length=tl, n_video_frames=n_frames,
+                fps=args.render_fps, cycle_stride=args.cycle_stride,
+                mode=args.anim_mode)
+        specs = []
+        if len(state["waypoints"]) >= 2:
+            specs.append({
+                "path_json": str(base), "scale": args.scale if hasattr(args, "scale") else 0.9,
+                "anim_mode": args.anim_mode, "offset_t": 0.0})
+        for et in extra_trajs:
+            specs.append({
+                "path_json": et["path"], "scale": et.get("scale", 0.9),
+                "anim_mode": "run", "offset_t": 0.0})
+        out = {"characters": specs}
+        multi_path = str(base.parent / "multi_config.json")
+        json.dump(out, open(multi_path, "w"), indent=2)
+        print(f"  exported multi config ({len(specs)} chars) to {multi_path}")
+        print(f"  → 渲染: --multi_traj {multi_path}")
 
     # ---- Init ----
     rebuild_trajectory()
