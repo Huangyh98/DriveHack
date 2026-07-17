@@ -7,8 +7,8 @@ Pipeline per output frame:
   2. Place the baked runner mesh at a world position; the run-in-place
      animation frame is advanced over time.
   3. Rasterize the character with nvdiffrast using the SAME camera K/c2w.
-  4. Depth-occlude: only write character pixels where char_z < scene_depth.
-  5. (optional) apply a coarse directional light estimated from the background.
+  4. Resolve scene/body/garment visibility with a dynamic per-pixel z-buffer.
+  5. Relight from world-space normals and match local scene photometry.
 
 Modes
 -----
@@ -52,6 +52,10 @@ logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
 
 CAMERA_NAMES = {0: "front", 1: "front_left", 2: "front_right", 3: "left", 4: "right"}
 MESH_NAMES = ["man", "clothes_1", "pants_1"]
+GARMENT_MESHES = {"clothes_1", "pants_1"}
+# Body and garment exports contain nearly coplanar surfaces. This camera-space
+# tie break prevents z-fighting without changing meaningful scene occlusion.
+GARMENT_DEPTH_BIAS_M = 0.002
 
 
 # --------------------------------------------------------------------------- #
@@ -299,7 +303,25 @@ def traj_json_yaw(path: str, t: float) -> float:
 # --------------------------------------------------------------------------- #
 # Rasterization (returns RGBA + per-pixel char depth)
 # --------------------------------------------------------------------------- #
-def rasterize_mesh(rast, verts_world, faces, uvs, tex, c2w, K, H, W, device):
+def compute_vertex_normals(verts: np.ndarray, faces: np.ndarray) -> np.ndarray:
+    """Area-weighted smooth vertex normals for one animated mesh frame."""
+    tri = verts[faces]
+    face_normals = np.cross(tri[:, 1] - tri[:, 0], tri[:, 2] - tri[:, 0])
+    normals = np.zeros_like(verts, dtype=np.float32)
+    for corner in range(3):
+        np.add.at(normals, faces[:, corner], face_normals)
+    return normals / np.maximum(np.linalg.norm(normals, axis=-1, keepdims=True), 1e-8)
+
+
+def transform_normals(normals: np.ndarray, transform: np.ndarray) -> np.ndarray:
+    """Transform normals correctly for a potentially scaled world transform."""
+    normal_matrix = np.linalg.inv(transform[:3, :3]).T
+    out = normals @ normal_matrix.T
+    return (out / np.maximum(np.linalg.norm(out, axis=-1, keepdims=True), 1e-8)).astype(np.float32)
+
+
+def rasterize_mesh(rast, verts_world, faces, uvs, tex, c2w, K, H, W, device,
+                   normals_world=None):
     """Rasterize a triangle mesh. Returns (rgba HxWx4 numpy, char_depth HxW numpy).
 
     char_depth is the camera-space z (forward distance, meters) of the closest
@@ -362,7 +384,16 @@ def rasterize_mesh(rast, verts_world, faces, uvs, tex, c2w, K, H, W, device):
 
     rgba = torch.cat([rgb, a], dim=-1).cpu().numpy()
     char_depth_np = char_depth.cpu().numpy()
-    return rgba, char_depth_np
+    normals_img = None
+    if normals_world is not None:
+        normals_np = (normals_world.detach().cpu().numpy()
+                      if torch.is_tensor(normals_world) else np.asarray(normals_world))
+        unw_normals = normals_np[faces_np].reshape(F * 3, 3)
+        normals_t = torch.from_numpy(unw_normals.astype(np.float32)).to(device)
+        normal_interp, _ = dr.interpolate(normals_t.contiguous(), rast_out, tri)
+        normals_img_t = torch.nn.functional.normalize(normal_interp[0], dim=-1, eps=1e-6)
+        normals_img = normals_img_t.cpu().numpy()
+    return rgba, char_depth_np, normals_img
 
 
 # --------------------------------------------------------------------------- #
@@ -601,6 +632,168 @@ def add_contact_shadow(composite: np.ndarray, foot_pixel, radius: float = 25.0,
     return np.clip(composite * (1.0 - shadow), 0, 1)
 
 
+def srgb_to_linear(rgb: np.ndarray) -> np.ndarray:
+    rgb = np.clip(rgb, 0.0, 1.0)
+    return np.where(rgb <= 0.04045, rgb / 12.92,
+                    np.maximum((rgb + 0.055) / 1.055, 0.0) ** 2.4)
+
+
+def linear_to_srgb(rgb: np.ndarray) -> np.ndarray:
+    rgb = np.maximum(rgb, 0.0)
+    return np.where(rgb <= 0.0031308, 12.92 * rgb,
+                    1.055 * rgb ** (1.0 / 2.4) - 0.055)
+
+
+def matched_scene_photometry(scene_rgb: np.ndarray, state: dict,
+                             smooth: float) -> Tuple[float, np.ndarray]:
+    """Estimate a temporally stable scene white level and weak illuminant tint."""
+    linear = srgb_to_linear(scene_rgb)
+    luminance = np.sum(linear * np.array([0.2126, 0.7152, 0.0722]), axis=-1)
+    values = luminance[np.isfinite(luminance) & (luminance > 1e-4)]
+    target_white = float(np.clip(np.quantile(values, 0.78) if values.size > 32
+                                 else np.mean(luminance), 0.18, 0.80))
+
+    flat = linear.reshape(-1, 3)
+    lum_flat = luminance.reshape(-1)
+    saturation = ((flat.max(-1) - flat.min(-1)) /
+                  np.maximum(flat.max(-1), 1e-4))
+    bright_cut = np.quantile(values, 0.65) if values.size > 32 else values.mean()
+    neutral = (lum_flat >= bright_cut) & (saturation < 0.22) & np.isfinite(lum_flat)
+    if neutral.sum() > 32:
+        tint = np.median(flat[neutral], axis=0)
+        tint = np.clip(tint / max(float(tint.mean()), 1e-4), 0.96, 1.04)
+    else:
+        tint = np.ones(3, dtype=np.float32)
+
+    smooth = float(np.clip(smooth, 0.0, 0.99))
+    if "target_white" in state:
+        target_white = smooth * state["target_white"] + (1.0 - smooth) * target_white
+        tint = smooth * state["tint"] + (1.0 - smooth) * tint
+    state["target_white"], state["tint"] = target_white, tint
+    return target_white, tint
+
+
+def local_scene_white(scene_rgb: np.ndarray, alpha: np.ndarray, fallback: float) -> float:
+    mask = alpha[..., 0] > 0.05
+    ys, xs = np.where(mask)
+    if ys.size < 16:
+        return fallback
+    H, W = mask.shape
+    height, width = int(ys.max() - ys.min() + 1), int(xs.max() - xs.min() + 1)
+    pad = max(10, int(0.35 * max(height, width)))
+    y0, y1 = max(0, int(ys.min()) - pad), min(H, int(ys.max()) + pad + 1)
+    x0, x1 = max(0, int(xs.min()) - pad), min(W, int(xs.max()) + pad + 1)
+    linear = srgb_to_linear(scene_rgb[y0:y1, x0:x1])
+    luminance = np.sum(linear * np.array([0.2126, 0.7152, 0.0722]), axis=-1)
+    outside = ~mask[y0:y1, x0:x1]
+    values = luminance[outside & np.isfinite(luminance) & (luminance > 1e-4)]
+    if values.size < 32:
+        return fallback
+    local = float(np.clip(1.05 * np.quantile(values, 0.90), 0.12, 0.72))
+    return 0.85 * local + 0.15 * fallback
+
+
+def matched_shade(rgb: np.ndarray, alpha: np.ndarray, normals_world: np.ndarray,
+                  scene_rgb: np.ndarray, target_white: float, tint: np.ndarray,
+                  state: dict, args) -> np.ndarray:
+    """Matte world-space sun+sky lighting with bounded temporal exposure."""
+    azimuth = np.deg2rad(float(args.sun_azimuth))
+    elevation = np.deg2rad(float(args.sun_elevation))
+    light_dir = np.array([np.cos(elevation) * np.cos(azimuth),
+                          np.cos(elevation) * np.sin(azimuth),
+                          np.sin(elevation)], dtype=np.float32)
+    ndotl = np.clip(np.sum(normals_world * light_dir, axis=-1), 0.0, 1.0)
+    irradiance = max(0.0, args.ambient_intensity) + max(0.0, args.sun_intensity) * ndotl
+
+    local_white = local_scene_white(scene_rgb, alpha, target_white)
+    raw_gain = float(np.clip(local_white / max(target_white, 1e-4), 0.0625, 16.0) ** 0.25)
+    limit = max(0.0, float(args.local_exposure_limit_ev))
+    desired_gain = float(np.clip(raw_gain, 2.0 ** (-limit), 2.0 ** limit))
+    smooth = float(np.clip(args.lighting_smooth, 0.0, 0.99))
+    gain = (smooth * state["gain"] + (1.0 - smooth) * desired_gain
+            if "gain" in state else desired_gain)
+    state["gain"] = gain
+
+    linear = srgb_to_linear(rgb)
+    shaded = linear_to_srgb(np.clip(
+        linear * irradiance[..., None] * gain * tint.reshape(1, 1, 3), 0.0, 1.0))
+    return np.clip(shaded, 0.0, 1.0)
+
+
+def apply_camera_grade(rgb: np.ndarray, exposure_ev: float, temperature_k: float) -> np.ndarray:
+    """Apply one camera response to both the 3DGS scene and inserted person."""
+    kelvin = float(np.clip(temperature_k, 3000.0, 9000.0))
+    warmth = (6500.0 - kelvin) / 3500.0
+    gains = np.array([1.0 + 0.10 * warmth, 1.0, 1.0 - 0.10 * warmth])
+    gains /= gains.mean()
+    linear = srgb_to_linear(rgb) * (2.0 ** float(exposure_ev)) * gains.reshape(1, 1, 3)
+    return np.clip(linear_to_srgb(np.clip(linear, 0.0, 1.0)), 0.0, 1.0)
+
+
+def composite_character(args, scene_rgb, scene_depth, c2w, K, H, W,
+                        base_meshes, rast, M, anim_idx, device,
+                        lighting_states, cam_key, texture_overrides=None):
+    """Composite one character with scene/mesh z-buffering and matched lighting."""
+    texture_overrides = texture_overrides or {}
+    depth_buffer = scene_depth.copy()
+    layers, all_verts_w = [], []
+    target_white, tint = 1.0, np.ones(3, dtype=np.float32)
+    if args.lighting_mode == "matched":
+        scene_state = lighting_states.setdefault(("scene", cam_key), {})
+        target_white, tint = matched_scene_photometry(
+            scene_rgb, scene_state, args.lighting_smooth)
+    elif args.lighting_mode == "legacy":
+        light_dir, ambient = estimate_light_direction(scene_rgb)
+
+    for name in MESH_NAMES:
+        mesh = base_meshes[name]
+        verts_w = apply_transform(mesh["verts_np"][anim_idx], M)
+        all_verts_w.append(verts_w)
+        normals_w = None
+        if args.lighting_mode == "matched":
+            normals_w = transform_normals(mesh["normals_np"][anim_idx], M)
+        rgba, char_depth, normals_img = rasterize_mesh(
+            rast, verts_w, mesh["faces"], mesh["uvs"],
+            texture_overrides.get(name, mesh["tex"]), c2w, K, H, W, device,
+            normals_world=normals_w)
+
+        if args.lighting_mode == "matched":
+            light_state = lighting_states.setdefault(("person", cam_key, name), {})
+            rgb_layer = matched_shade(rgba[..., :3], rgba[..., 3:4], normals_img,
+                                      scene_rgb, target_white, tint, light_state, args)
+        elif args.lighting_mode == "legacy":
+            rgb_layer = shade(rgba[..., :3], light_dir, ambient)
+        else:
+            rgb_layer = rgba[..., :3]
+
+        test_depth = char_depth - (GARMENT_DEPTH_BIAS_M if name in GARMENT_MESHES else 0.0)
+        present = rgba[..., 3] > 0.01
+        visible = present & (test_depth < depth_buffer)
+        depth_buffer = np.where(visible, test_depth, depth_buffer)
+        layers.append((rgb_layer, rgba[..., 3:4], visible))
+
+    char_mask = np.zeros((H, W), dtype=bool)
+    for _, _, visible in layers:
+        char_mask |= visible
+
+    composite = scene_rgb.copy()
+    foot_cam = np.linalg.inv(c2w) @ np.array([M[0, 3], M[1, 3], M[2, 3], 1.0])
+    if char_mask.any() and foot_cam[2] > 1e-3:
+        foot_px = (K[0, 0] * foot_cam[0] / foot_cam[2] + K[0, 2],
+                   K[1, 1] * foot_cam[1] / foot_cam[2] + K[1, 2])
+        radius = float(np.clip(180.0 / foot_cam[2], 5.0, 24.0))
+        composite = add_contact_shadow(composite, foot_px, radius,
+                                       float(args.contact_shadow_darkness))
+
+    for rgb_layer, alpha_layer, visible in layers:
+        alpha = alpha_layer * visible[..., None].astype(np.float32)
+        composite = composite * (1.0 - alpha) + rgb_layer * alpha
+    if args.lighting_mode == "matched":
+        composite = apply_camera_grade(composite, args.scene_exposure_ev,
+                                       args.scene_temperature_k)
+    return np.clip(composite, 0.0, 1.0), char_mask, all_verts_w
+
+
 # --------------------------------------------------------------------------- #
 # Main
 # --------------------------------------------------------------------------- #
@@ -632,12 +825,27 @@ def main(args) -> None:
     n_anim = int(seq["n_frames"])
     base_meshes = {}
     for name in MESH_NAMES:
+        verts_np = seq[f"{name}/verts"].astype(np.float32)
+        faces_np = np.asarray(seq[f"{name}/faces"])
         base_meshes[name] = {
-            "verts": torch.from_numpy(seq[f"{name}/verts"]).float().to(device),
-            "faces": torch.from_numpy(seq[f"{name}/faces"]).int().to(device),
+            "verts": torch.from_numpy(verts_np).float().to(device),
+            "verts_np": verts_np,
+            "faces": torch.from_numpy(faces_np).int().to(device),
             "uvs": torch.from_numpy(seq[f"{name}/uvs"]).float().to(device),
             "tex": torch.from_numpy(seq[f"{name}/tex"]).float().to(device) / 255.0,
         }
+        if args.lighting_mode == "matched":
+            base_meshes[name]["normals_np"] = np.stack([
+                compute_vertex_normals(frame_verts, faces_np)
+                for frame_verts in verts_np
+            ])
+    if args.clothes_rgb:
+        rgb = parse_rgb(args.clothes_rgb)
+        for name in GARMENT_MESHES:
+            tex = base_meshes[name]["tex"].clone()
+            tex[..., :3] = torch.as_tensor(rgb, dtype=tex.dtype, device=tex.device)
+            base_meshes[name]["tex"] = tex
+        logger.info("Using solid garment RGB=(%.3f, %.3f, %.3f)", *rgb)
     logger.info("Loaded %d animation frames, %d meshes.", n_anim, len(base_meshes))
 
     import nvdiffrast.torch as dr
@@ -793,6 +1001,7 @@ def render_video(args, get_scene, base_meshes, rast, n_anim, cam_ids, frame_ids,
     """Single-camera video with depth occlusion, ground anchoring, contact shadow."""
     cam_idx = cam_ids[0]
     writer = imageio.get_writer(args.out, mode="I", fps=args.fps)
+    lighting_states = {}
 
     # Precompute character XY trajectory for ground Z table
     char_traj_xy = []
@@ -829,32 +1038,9 @@ def render_video(args, get_scene, base_meshes, rast, n_anim, cam_ids, frame_ids,
         # displacement. anim_speed here is anim-frames per output-frame.
         anim_idx = int((oi * args.anim_speed) % n_anim)
         M = build_world_transform(position, yaw, args.scale, feet_offset=args.feet_offset)
-
-        composite = scene_rgb.copy()
-        light_dir, ambient = estimate_light_direction(scene_rgb)
-
-        # collect foot pixel for contact shadow (project character origin)
-        foot_world = np.array([position[0], position[1], gz, 1.0])
-        foot_cam = np.linalg.inv(c2w) @ foot_world
-        foot_px = (K[0, 0] * foot_cam[0] / foot_cam[2] + K[0, 2],
-                   K[1, 1] * foot_cam[1] / foot_cam[2] + K[1, 2])
-
-        char_mask = np.zeros((H, W), dtype=bool)
-        for name in MESH_NAMES:
-            m = base_meshes[name]
-            verts_w = apply_transform(m["verts"][anim_idx].cpu().numpy(), M)
-            rgba, char_depth = rasterize_mesh(rast, torch.from_numpy(verts_w).float().to(device),
-                                              m["faces"], m["uvs"], m["tex"], c2w, K, H, W, device)
-            # depth occlusion: keep char pixel only if char is closer
-            closer = (char_depth < scene_depth) & (rgba[..., 3] > 0.5)
-            alpha = closer[..., None].astype(np.float32)
-            rgb_layer = shade(rgba[..., :3], light_dir, ambient)
-            composite = composite * (1 - alpha) + rgb_layer * alpha
-            char_mask |= closer
-
-        # contact shadow at the feet, only on background pixels (not over body)
-        if char_mask.any():
-            composite = add_contact_shadow(composite, foot_px, radius=max(15.0, 30.0 * 8.0 / max(position[0], 1.0)))
+        composite, _, _ = composite_character(
+            args, scene_rgb, scene_depth, c2w, K, H, W, base_meshes, rast,
+            M, anim_idx, device, lighting_states, cam_idx)
 
         frame_u8 = (np.clip(composite, 0, 1) * 255).astype(np.uint8)
         writer.append_data(frame_u8)
@@ -886,6 +1072,7 @@ def render_multicam_grid(args, get_scene, base_meshes, rast, n_anim, cam_ids, fr
     grid_cols, grid_rows = 3, 2
 
     writer = imageio.get_writer(args.out, mode="I", fps=args.fps)
+    lighting_states = {}
 
     # Precompute character's full trajectory XY for the BEV mini-map
     char_traj_xy = []
@@ -944,30 +1131,9 @@ def render_multicam_grid(args, get_scene, base_meshes, rast, n_anim, cam_ids, fr
         cam_frames = []
         for ci, cam_idx in enumerate(cam_ids):
             scene_rgb, scene_depth, scene_bg_depth, c2w, K, H, W, cam_name = get_scene(frame_idx, cam_idx)
-            composite = scene_rgb.copy()
-            light_dir, ambient = estimate_light_direction(scene_rgb)
-
-            foot_world = np.array([position[0], position[1], gz, 1.0])
-            foot_cam = np.linalg.inv(c2w) @ foot_world
-            foot_px = (K[0, 0] * foot_cam[0] / foot_cam[2] + K[0, 2],
-                       K[1, 1] * foot_cam[1] / foot_cam[2] + K[1, 2])
-
-            char_mask = np.zeros((H, W), dtype=bool)
-            all_verts_w = []  # collect transformed verts for tight bbox
-            for name in MESH_NAMES:
-                m = base_meshes[name]
-                verts_w = apply_transform(m["verts"][anim_idx].cpu().numpy(), M)
-                all_verts_w.append(verts_w)
-                rgba, char_depth = rasterize_mesh(rast, torch.from_numpy(verts_w).float().to(device),
-                                                  m["faces"], m["uvs"], m["tex"], c2w, K, H, W, device)
-                closer = (char_depth < scene_depth) & (rgba[..., 3] > 0.5)
-                alpha = closer[..., None].astype(np.float32)
-                rgb_layer = shade(rgba[..., :3], light_dir, ambient)
-                composite = composite * (1 - alpha) + rgb_layer * alpha
-                char_mask |= closer
-
-            if char_mask.any():
-                composite = add_contact_shadow(composite, foot_px, radius=max(15.0, 30.0 * 8.0 / max(position[0], 1.0)))
+            composite, char_mask, all_verts_w = composite_character(
+                args, scene_rgb, scene_depth, c2w, K, H, W, base_meshes, rast,
+                M, anim_idx, device, lighting_states, cam_idx)
 
             # Add camera name label + tight 3D bounding box around character
             from PIL import Image, ImageDraw, ImageFont
@@ -1025,6 +1191,7 @@ def render_multiview(args, get_scene, base_meshes, rast, n_anim, cam_ids, frame_
     total = len(positions) * len(clothes_tex_list) * len(frame_ids) * len(cam_ids)
     logger.info("Generating %d images into %s", total, out_dir)
     done = 0
+    lighting_states = {}
 
     for pi, position in enumerate(positions):
         yaw = args.yaw
@@ -1036,19 +1203,10 @@ def render_multiview(args, get_scene, base_meshes, rast, n_anim, cam_ids, frame_
                 anim_idx = int((frame_idx * args.anim_speed) % n_anim)
                 for cam_idx in cam_ids:
                     scene_rgb, scene_depth, scene_bg_depth, c2w, K, H, W, cam_name = get_scene(frame_idx, cam_idx)
-                    composite = scene_rgb.copy()
-                    light_dir, ambient = estimate_light_direction(scene_rgb)
-                    for name in MESH_NAMES:
-                        m = base_meshes[name]
-                        # swap clothes texture for this batch
-                        tex = clothes_tex if name == "clothes_1" else m["tex"]
-                        verts_w = apply_transform(m["verts"][anim_idx].cpu().numpy(), M)
-                        rgba, char_depth = rasterize_mesh(rast, torch.from_numpy(verts_w).float().to(device),
-                                                          m["faces"], m["uvs"], tex, c2w, K, H, W, device)
-                        closer = (char_depth < scene_depth) & (rgba[..., 3] > 0.5)
-                        alpha = closer[..., None].astype(np.float32)
-                        rgb_layer = shade(rgba[..., :3], light_dir, ambient)
-                        composite = composite * (1 - alpha) + rgb_layer * alpha
+                    composite, _, _ = composite_character(
+                        args, scene_rgb, scene_depth, c2w, K, H, W,
+                        base_meshes, rast, M, anim_idx, device, lighting_states,
+                        (pi, ti, cam_idx), texture_overrides={"clothes_1": clothes_tex})
 
                     frame_u8 = (np.clip(composite, 0, 1) * 255).astype(np.uint8)
                     fname = sub / f"frame{frame_idx:03d}_{cam_name}.png"
@@ -1063,6 +1221,21 @@ def render_multiview(args, get_scene, base_meshes, rast, n_anim, cam_ids, frame_
 # --------------------------------------------------------------------------- #
 # CLI parsing helpers
 # --------------------------------------------------------------------------- #
+def parse_rgb(spec: str) -> Tuple[float, float, float]:
+    """Parse R,G,B expressed in either 0..1 or 0..255."""
+    try:
+        values = [float(v.strip()) for v in spec.split(",")]
+    except ValueError as exc:
+        raise ValueError("RGB must look like 1,1,1 or 255,255,255") from exc
+    if len(values) != 3:
+        raise ValueError("RGB must contain exactly three values")
+    if max(values) > 1.0:
+        values = [v / 255.0 for v in values]
+    if any(v < 0.0 or v > 1.0 for v in values):
+        raise ValueError("RGB values must be in 0..1 or 0..255")
+    return tuple(values)
+
+
 def parse_positions(spec: str) -> List[Tuple[float, float, float]]:
     """Parse 'x,y,z;x,y,z' into a list of positions. Empty -> single default."""
     if not spec or not spec.strip():
@@ -1142,7 +1315,26 @@ if __name__ == "__main__":
     parser.add_argument("--cameras", default="", help="comma-sep cam ids, e.g. 0,1,2 (empty=all)")
     parser.add_argument("--positions", default="", help="'x,y,z;x,y,z' placements (empty=default)")
     parser.add_argument("--clothes_textures", default="", help="';'-separated PNG paths (empty=original)")
+    parser.add_argument("--clothes_rgb", default="",
+                        help="solid shirt+pants color as R,G,B in 0..1 or 0..255; e.g. 1,1,1")
     parser.add_argument("--frames", default="", help="comma-sep frame ids (empty=auto)")
+    parser.add_argument("--lighting_mode", choices=["matched", "legacy", "none"], default="matched",
+                        help="matched=world-normal relighting and scene photometry; legacy=2D gradient")
+    parser.add_argument("--sun_azimuth", type=float, default=135.0,
+                        help="world-space sun azimuth in degrees")
+    parser.add_argument("--sun_elevation", type=float, default=50.0,
+                        help="world-space sun elevation in degrees")
+    parser.add_argument("--sun_intensity", type=float, default=0.42)
+    parser.add_argument("--ambient_intensity", type=float, default=0.28)
+    parser.add_argument("--local_exposure_limit_ev", type=float, default=0.35,
+                        help="maximum local exposure correction for the character")
+    parser.add_argument("--lighting_smooth", type=float, default=0.90,
+                        help="temporal smoothing for scene tint and character exposure")
+    parser.add_argument("--contact_shadow_darkness", type=float, default=0.18)
+    parser.add_argument("--scene_exposure_ev", type=float, default=0.0,
+                        help="global exposure applied after scene+character compositing")
+    parser.add_argument("--scene_temperature_k", type=float, default=6500.0,
+                        help="global post-composite color temperature; 6500 preserves checkpoint color")
     parser.add_argument("opts", nargs=argparse.REMAINDER, default=None)
     args = parser.parse_args()
     main(args)

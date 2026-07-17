@@ -38,7 +38,7 @@
 
 ## 📖 Overview
 
-**DriveHack** lets you inject a fully-textured running character into a [DriveStudio](https://github.com/ziyc/drivestudio) / OmniRe reconstructed autonomous driving scene. Draw a trajectory in a browser-based 3D editor, and the character runs along it with **gait-matched, slide-free** animation and correct **depth occlusion** against the 3DGS background.
+**DriveHack** lets you inject a fully-textured running character into a [DriveStudio](https://github.com/ziyc/drivestudio) / OmniRe reconstructed autonomous driving scene. Draw a trajectory in a browser-based 3D editor, and the character runs along it with **gait-matched, slide-free** animation, per-pixel **depth occlusion**, and scene-matched **world-space relighting**.
 
 Built for **autonomous driving robustness testing**: generate adversarial pedestrian scenarios at scale on photoreal 3DGS scenes.
 
@@ -51,7 +51,10 @@ Built for **autonomous driving robustness testing**: generate adversarial pedest
 | 🎮 | **Browser-based 3D Trajectory Editor** | Draw trajectories directly in the 3DGS scene. Real-time gsplat rendering via viser/nerfview. |
 | 🚗 | **Dynamic Obstacles** | Vehicles/pedestrians/cyclists move with the time slider. Time-synchronized 3D collision detection. |
 | 👟 | **Gait-Matched Animation** | Never slide. Never overshoot. Step frequency auto-computed from trajectory length & video duration. |
-| 🎬 | **5-Camera + BEV Grid Rendering** | Waymo's 5 cameras tiled 3×2 with a BEV mini-map. Depth-occluded compositing. |
+| 🎬 | **5-Camera + BEV Grid Rendering** | Waymo's synchronized 5 cameras tiled 3×2 with a BEV mini-map. |
+| 💡 | **Scene-Matched Relighting** | World-space mesh normals, sun/sky lighting, local exposure, scene tint, and temporal smoothing. |
+| 🧍 | **Correct Mesh Occlusion** | A dynamic per-pixel z-buffer handles scene/body/shirt/trousers; a 2 mm garment tie-break removes coplanar z-fighting. |
+| 🌡️ | **Unified Camera Grade** | Apply one exposure and color-temperature response after scene/character compositing. |
 | 🧊 | **Custom Characters** | Bake any Mixamo character with Blender. |
 | 📦 | **Export & Visualization** | Export 3DGS checkpoints to PLY. Interactive viewers for scenes and PLY files. |
 
@@ -186,12 +189,51 @@ In the browser:
 python tools/render_runner_video.py \
     --resume_from outputs/waymo_omnire/scene23/checkpoint_final.pth \
     --path_json outputs/waymo_omnire/scene23/trajectories/traj_live.json \
+    --lighting_mode matched \
     --out outputs/waymo_omnire/scene23/videos_eval/scene23_v3.mp4
 ```
 
 Done! Output is a 3×2 grid: 5 camera views + BEV mini-map, with the character depth-occluded by the scene.
 
 > 📖 Full parameter reference: [docs/trajectory_pipeline.md](docs/trajectory_pipeline.md)
+
+### Rendering and relighting
+
+`matched` is the default lighting mode. It computes smooth vertex normals for the animated body, shirt, and trousers, transforms them into world space, and applies a matte directional sun plus ambient sky term. Local scene luminance and neutral highlights provide bounded exposure/tint correction with temporal smoothing, so the inserted character follows the checkpoint's illumination without frame-to-frame flicker.
+
+```bash
+# Neutral white clothes for a clean detector/reference comparison
+python tools/render_runner_video.py \
+    --resume_from outputs/waymo_omnire/scene23/checkpoint_final.pth \
+    --path_json outputs/waymo_omnire/scene23/trajectories/traj_live.json \
+    --clothes_rgb 1,1,1 \
+    --lighting_mode matched \
+    --sun_azimuth 135 --sun_elevation 50 \
+    --ambient_intensity 0.28 --sun_intensity 0.42 \
+    --local_exposure_limit_ev 0.35 \
+    --contact_shadow_darkness 0.18 \
+    --scene_exposure_ev 0 \
+    --scene_temperature_k 6500 \
+    --out outputs/waymo_omnire/scene23/videos_eval/white_matched.mp4
+```
+
+Useful compatibility/debug modes:
+
+- `--lighting_mode legacy` uses the original image-space brightness-gradient shading.
+- `--lighting_mode none` keeps the baked texture color without relighting.
+- `--clothes_rgb R,G,B` accepts either `0..1` or `0..255` values and preserves the original garment alpha.
+- `--scene_exposure_ev` and `--scene_temperature_k` affect the complete composite, keeping character and background in the same camera response.
+
+Occlusion is resolved against a dynamic camera-space depth buffer. Each visible mesh pixel is written back before the next mesh is tested, so the body, sleeves, shirt, and trousers cannot overwrite one another according to file order. Garments receive only a 2 mm tie-break for almost-coplanar exported surfaces; normal arm, vehicle, and background depth relationships remain unchanged. Contact shadows are applied to the background layer before the character.
+
+The multi-camera output is a synchronized comparison grid, not a seamless panorama:
+
+```text
+front_left | front | front_right
+left       |  BEV  | right
+```
+
+Every camera is independently rendered with its own intrinsics/extrinsics at the same scene timestamp, resized to 640×480, placed in a 1920×960 canvas, and encoded at `--fps`. A seamless panorama would additionally require geometric reprojection and overlap blending, which this comparison view intentionally does not perform.
 
 ## 🧊 Custom Character Baking
 
